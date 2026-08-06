@@ -105,6 +105,7 @@ enum ContentDropZone {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PaneEmptyReason {
+    ClosedLastTerminal,
     ClosedLastTab,
     MovedLastTabOut,
 }
@@ -174,6 +175,19 @@ pub fn find_pane_widget_by_id(pane_id: u32) -> Option<gtk::Widget> {
     lookup_pane_internals(pane_id).map(|internals| internals.pane_outer.clone().upcast())
 }
 
+pub fn retire_pane(pane_widget: &gtk::Widget) {
+    let Some(outer) = pane_widget.downcast_ref::<gtk::Box>() else {
+        return;
+    };
+    let internals = unsafe { outer.steal_data::<Rc<PaneInternals>>("limux-pane-internals") };
+    if let Some(internals) = internals {
+        for entry in &internals.tab_state.borrow().tabs {
+            entry.prepare_for_removal();
+        }
+        unregister_pane(internals.pane_id);
+    }
+}
+
 pub fn set_workspace_dragging_all(active: bool) {
     PANE_REGISTRY.with(|registry| {
         for weak in registry.borrow().values() {
@@ -196,6 +210,7 @@ type PanePathCallback = dyn Fn(&str);
 type PaneDesktopNotificationCallback = dyn Fn(&str, &str, bool, u32, &str);
 type PaneEmptyCallback = dyn Fn(&gtk::Widget, PaneEmptyReason);
 type PaneOpenBrowserHereCallback = dyn Fn(&gtk::Widget);
+type PaneVisibilityCallback = dyn Fn(&gtk::Widget) -> bool;
 type PaneShortcutStateCallback = dyn Fn() -> Rc<ResolvedShortcutConfig>;
 type PaneShortcutCaptureCallback =
     dyn Fn(ShortcutId, Option<NormalizedShortcut>) -> Result<ResolvedShortcutConfig, String>;
@@ -208,6 +223,7 @@ type PaneConfigChangedCallback = dyn Fn(&AppConfig, &AppConfig);
 type PaneWorkspaceLookupCallback = dyn Fn(&gtk::Widget) -> Option<String>;
 
 pub struct PaneCallbacks {
+    pub workspace_id: String,
     pub on_split: Box<PaneSplitCallback>,
     pub on_close_pane: Box<PaneWidgetCallback>,
     pub on_bell: Box<PaneBellCallback>,
@@ -219,6 +235,8 @@ pub struct PaneCallbacks {
     pub on_pwd_changed: Box<PanePathCallback>,
     pub on_empty: Box<PaneEmptyCallback>,
     pub on_state_changed: Box<PaneSignalCallback>,
+    pub on_unread_changed: Box<PaneSignalCallback>,
+    pub is_pane_visible: Box<PaneVisibilityCallback>,
     pub on_split_with_tab: Box<PaneSplitWithTabCallback>,
     pub current_config: Box<PaneConfigCallback>,
     pub on_config_changed: Rc<PaneConfigChangedCallback>,
@@ -385,6 +403,11 @@ pub const PANE_CSS: &str = r#"
     background: alpha(@window_fg_color, 0.08);
 }
 .limux-pin-icon {
+    font-size: 9px;
+    margin-right: 2px;
+}
+.limux-tab-unread-dot {
+    color: @accent_bg_color;
     font-size: 9px;
     margin-right: 2px;
 }
@@ -663,6 +686,12 @@ pub fn cycle_tab_in_pane(pane_widget: &gtk::Widget, delta: i32) {
         &internals.tab_state,
         &new_id,
     );
+    clear_tab_unread_if_visible(
+        &internals.tab_state,
+        &new_id,
+        &internals.pane_outer.clone().upcast(),
+        &internals.callbacks,
+    );
     (internals.callbacks.on_state_changed)();
 }
 
@@ -688,6 +717,12 @@ pub fn focus_active_tab_in_pane(pane_widget: &gtk::Widget) -> bool {
         &internals.content_stack,
         &internals.tab_state,
         &tab_id,
+    );
+    clear_tab_unread_if_visible(
+        &internals.tab_state,
+        &tab_id,
+        &internals.pane_outer.clone().upcast(),
+        &internals.callbacks,
     );
     true
 }
@@ -762,7 +797,40 @@ pub fn activate_tab_in_pane(pane_widget: &gtk::Widget, tab_id: &str) -> bool {
         &internals.tab_state,
         tab_id,
     );
+    clear_tab_unread_if_visible(
+        &internals.tab_state,
+        tab_id,
+        &internals.pane_outer.clone().upcast(),
+        &internals.callbacks,
+    );
     true
+}
+
+fn set_tab_unread(entry: &mut TabEntry, unread: bool) -> bool {
+    if entry.unread == unread {
+        return false;
+    }
+    entry.unread = unread;
+    entry.unread_dot.set_visible(unread);
+    true
+}
+
+fn clear_tab_unread(tab_state: &Rc<RefCell<TabState>>, tab_id: &str) -> bool {
+    tab_state
+        .borrow_mut()
+        .find_tab_mut(tab_id)
+        .is_some_and(|entry| set_tab_unread(entry, false))
+}
+
+fn clear_tab_unread_if_visible(
+    tab_state: &Rc<RefCell<TabState>>,
+    tab_id: &str,
+    pane_widget: &gtk::Widget,
+    callbacks: &Rc<PaneCallbacks>,
+) {
+    if (callbacks.is_pane_visible)(pane_widget) && clear_tab_unread(tab_state, tab_id) {
+        (callbacks.on_unread_changed)();
+    }
 }
 
 fn normalize_surface_hint(raw: &str) -> &str {
@@ -887,9 +955,11 @@ struct TabEntry {
     id: String,
     tab_button: gtk::Box,
     title_label: gtk::Label,
+    unread_dot: gtk::Label,
     content: gtk::Widget,
     custom_name: Option<String>,
     pinned: bool,
+    unread: bool,
     kind: TabKind,
 }
 
@@ -1137,11 +1207,7 @@ fn make_terminal_callbacks(
             if has_custom || title.is_empty() {
                 return;
             }
-            let display = if title.len() > 22 {
-                format!("{}…", &title[..21])
-            } else {
-                title.to_string()
-            };
+            let display = display_terminal_title(title);
             title_label.set_label(&display);
         }),
         on_pwd_changed: Box::new(move |pwd: &str| {
@@ -1235,6 +1301,17 @@ fn make_terminal_callbacks(
     }
 }
 
+fn display_terminal_title(title: &str) -> String {
+    let mut indices = title.char_indices();
+    let Some((truncate_at, _)) = indices.nth(21) else {
+        return title.to_string();
+    };
+    if indices.next().is_none() {
+        return title.to_string();
+    }
+    format!("{}…", &title[..truncate_at])
+}
+
 fn is_safe_browser_url(url: &str) -> bool {
     // Minimal allow-list of URI schemes that may be handed to the system
     // browser on Ctrl+click. The threat model is hostile terminal output:
@@ -1318,7 +1395,7 @@ fn add_terminal_tab_inner(
         .as_ref()
         .and_then(|value| value.id.map(|id| id.to_string()))
         .unwrap_or_else(next_tab_id);
-    let (tab_btn, title_label) = build_tab_button("Terminal", &tab_id, internals);
+    let (tab_btn, title_label, unread_dot) = build_tab_button("Terminal", &tab_id, internals);
 
     let term_cwd = Rc::new(RefCell::new(
         options
@@ -1398,11 +1475,13 @@ fn add_terminal_tab_inner(
             id: tab_id.clone(),
             tab_button: tab_btn,
             title_label: title_label.clone(),
+            unread_dot,
             content: widget,
             custom_name: options
                 .as_ref()
                 .and_then(|value| value.custom_name.map(|name| name.to_string())),
             pinned: options.as_ref().map(|value| value.pinned).unwrap_or(false),
+            unread: false,
             kind: TabKind::Terminal {
                 state: TerminalTabState {
                     cwd: term_cwd.clone(),
@@ -1465,7 +1544,7 @@ fn add_browser_tab_inner(internals: &Rc<PaneInternals>, options: Option<BrowserT
         internals.callbacks.clone(),
     );
 
-    let (tab_btn, title_label) = build_tab_button(&title, &tab_id, internals);
+    let (tab_btn, title_label, unread_dot) = build_tab_button(&title, &tab_id, internals);
 
     internals.content_stack.add_named(&widget, Some(&tab_id));
 
@@ -1475,11 +1554,13 @@ fn add_browser_tab_inner(internals: &Rc<PaneInternals>, options: Option<BrowserT
             id: tab_id.clone(),
             tab_button: tab_btn,
             title_label: title_label.clone(),
+            unread_dot,
             content: widget,
             custom_name: options
                 .as_ref()
                 .and_then(|value| value.custom_name.map(|name| name.to_string())),
             pinned: options.as_ref().map(|value| value.pinned).unwrap_or(false),
+            unread: false,
             kind: TabKind::Browser {
                 state: BrowserTabState {
                     uri: saved_uri.clone(),
@@ -1532,7 +1613,7 @@ fn add_keybind_editor_tab_inner(internals: &Rc<PaneInternals>, input: KeybindsTa
         .and_then(|value| value.id.map(|id| id.to_string()))
         .unwrap_or_else(next_tab_id);
 
-    let (tab_btn, title_label) = build_tab_button("Keybinds", &tab_id, internals);
+    let (tab_btn, title_label, unread_dot) = build_tab_button("Keybinds", &tab_id, internals);
 
     let widget = keybind_editor::build_keybind_editor(&input.shortcuts, input.on_capture);
     internals.content_stack.add_named(&widget, Some(&tab_id));
@@ -1543,6 +1624,7 @@ fn add_keybind_editor_tab_inner(internals: &Rc<PaneInternals>, input: KeybindsTa
             id: tab_id.clone(),
             tab_button: tab_btn,
             title_label: title_label.clone(),
+            unread_dot,
             content: widget,
             custom_name: input
                 .options
@@ -1553,6 +1635,7 @@ fn add_keybind_editor_tab_inner(internals: &Rc<PaneInternals>, input: KeybindsTa
                 .as_ref()
                 .map(|value| value.pinned)
                 .unwrap_or(false),
+            unread: false,
             kind: TabKind::Keybinds,
         });
     }
@@ -1800,6 +1883,98 @@ fn pane_internals_for_root(root: &gtk::Widget) -> Vec<Rc<PaneInternals>> {
     panes
 }
 
+fn pane_internals_for_workspace(workspace_id: &str) -> Vec<Rc<PaneInternals>> {
+    let mut panes = PANE_REGISTRY.with(|registry| {
+        registry
+            .borrow()
+            .values()
+            .filter_map(|weak| weak.upgrade())
+            .filter(|internals| internals.callbacks.workspace_id == workspace_id)
+            .collect::<Vec<_>>()
+    });
+    panes.sort_by_key(|internals| internals.pane_id);
+    panes
+}
+
+pub enum TabTargetResolution {
+    NotFound,
+    Unique(u32, String),
+    Ambiguous,
+}
+
+pub fn tab_target_for_workspace(workspace_id: &str, surface_hint: &str) -> TabTargetResolution {
+    let mut target = None;
+    for internals in pane_internals_for_workspace(workspace_id) {
+        let pane_id = internals.pane_id;
+        let tab_state = internals.tab_state.borrow();
+        for entry in &tab_state.tabs {
+            let surface_id = composite_surface_id(pane_id, &entry.id);
+            if surface_hint_matches(&surface_id, &entry.id, surface_hint) {
+                if target.is_some() {
+                    return TabTargetResolution::Ambiguous;
+                }
+                target = Some((pane_id, entry.id.clone()));
+            }
+        }
+    }
+    match target {
+        Some((pane_id, tab_id)) => TabTargetResolution::Unique(pane_id, tab_id),
+        None => TabTargetResolution::NotFound,
+    }
+}
+
+pub fn mark_tab_unread_in_workspace(
+    workspace_id: &str,
+    pane_id: u32,
+    tab_id: &str,
+) -> Option<bool> {
+    let internals = pane_internals_for_workspace(workspace_id)
+        .into_iter()
+        .find(|internals| internals.pane_id == pane_id)?;
+    let mut tab_state = internals.tab_state.borrow_mut();
+    let entry = tab_state.find_tab_mut(tab_id)?;
+    Some(set_tab_unread(entry, true))
+}
+
+pub fn tab_is_visible_in_workspace(
+    workspace_id: &str,
+    root: &gtk::Widget,
+    pane_id: u32,
+    tab_id: &str,
+) -> bool {
+    pane_internals_for_workspace(workspace_id)
+        .into_iter()
+        .find(|internals| internals.pane_id == pane_id)
+        .is_some_and(|internals| {
+            internals.pane_outer.is_ancestor(root)
+                && internals.tab_state.borrow().active_tab.as_deref() == Some(tab_id)
+        })
+}
+
+pub fn clear_active_tab_unread_in_root(root: &gtk::Widget) -> bool {
+    let mut changed = false;
+    for internals in pane_internals_for_root(root) {
+        let active_tab = internals.tab_state.borrow().active_tab.clone();
+        if let Some(tab_id) = active_tab {
+            changed |= clear_tab_unread(&internals.tab_state, &tab_id);
+        }
+    }
+    changed
+}
+
+pub fn workspace_has_unread_tabs(workspace_id: &str) -> bool {
+    pane_internals_for_workspace(workspace_id)
+        .into_iter()
+        .any(|internals| {
+            internals
+                .tab_state
+                .borrow()
+                .tabs
+                .iter()
+                .any(|entry| entry.unread)
+        })
+}
+
 pub fn pane_summaries_for_root(root: &gtk::Widget) -> Vec<PaneSummary> {
     pane_internals_for_root(root)
         .into_iter()
@@ -2024,17 +2199,17 @@ fn build_tab_button(
     title: &str,
     tab_id: &str,
     internals: &Rc<PaneInternals>,
-) -> (gtk::Box, gtk::Label) {
+) -> (gtk::Box, gtk::Label, gtk::Label) {
     let label = new_tab_title_label(title);
-    let tab_button = build_tab_button_from_label(&label, tab_id, internals);
-    (tab_button, label)
+    let (tab_button, unread_dot) = build_tab_button_from_label(&label, tab_id, internals);
+    (tab_button, label, unread_dot)
 }
 
 fn build_tab_button_from_label(
     label: &gtk::Label,
     tab_id: &str,
     internals: &Rc<PaneInternals>,
-) -> gtk::Box {
+) -> (gtk::Box, gtk::Label) {
     if let Some(parent) = label
         .parent()
         .and_then(|parent| parent.downcast::<gtk::Box>().ok())
@@ -2047,6 +2222,11 @@ fn build_tab_button_from_label(
     pin_icon.set_visible(false);
     pin_icon.set_can_target(false);
 
+    let unread_dot = gtk::Label::new(Some("\u{25CF}"));
+    unread_dot.add_css_class("limux-tab-unread-dot");
+    unread_dot.set_visible(false);
+    unread_dot.set_can_target(false);
+
     let close_btn = gtk::Button::builder()
         .icon_name("window-close-symbolic")
         .has_frame(false)
@@ -2056,6 +2236,7 @@ fn build_tab_button_from_label(
     let inner_box = gtk::Box::new(gtk::Orientation::Horizontal, 2);
     inner_box.set_can_target(false);
     inner_box.append(&pin_icon);
+    inner_box.append(&unread_dot);
     inner_box.append(label);
 
     let tab_btn = gtk::Box::new(gtk::Orientation::Horizontal, 0);
@@ -2071,6 +2252,7 @@ fn build_tab_button_from_label(
         let content_stack = internals.content_stack.clone();
         let tab_state = internals.tab_state.clone();
         let callbacks = internals.callbacks.clone();
+        let pane_widget = internals.pane_outer.downgrade();
         let tab_button = tab_btn.clone();
         click.connect_pressed(move |gesture, _, _, _| {
             if handle_tab_interaction_while_renaming(&tab_button, &tab_state) {
@@ -2078,6 +2260,14 @@ fn build_tab_button_from_label(
                 return;
             }
             activate_tab(&tab_strip, &content_stack, &tab_state, &tab_id);
+            if let Some(pane_widget) = pane_widget.upgrade() {
+                clear_tab_unread_if_visible(
+                    &tab_state,
+                    &tab_id,
+                    pane_widget.upcast_ref(),
+                    &callbacks,
+                );
+            }
             (callbacks.on_state_changed)();
         });
     }
@@ -2178,7 +2368,7 @@ fn build_tab_button_from_label(
         });
     }
 
-    tab_btn
+    (tab_btn, unread_dot)
 }
 
 fn show_tab_context_menu(tab_btn: &gtk::Box, tab_id: &str, context: &TabContextMenuContext) {
@@ -2286,7 +2476,9 @@ fn show_tab_context_menu(tab_btn: &gtk::Box, tab_id: &str, context: &TabContextM
     menu.popup();
 }
 
-fn find_tab_rename_entry<W: glib::object::IsA<gtk::Widget>>(root: &W) -> Option<gtk::Entry> {
+pub(crate) fn find_tab_rename_entry<W: glib::object::IsA<gtk::Widget>>(
+    root: &W,
+) -> Option<gtk::Entry> {
     fn find_entry(widget: &gtk::Widget) -> Option<gtk::Entry> {
         if let Some(entry) = widget.downcast_ref::<gtk::Entry>() {
             if entry.has_css_class(TAB_RENAME_ENTRY_CSS_CLASS) {
@@ -2652,10 +2844,14 @@ fn rebind_moved_tab_entry(entry: &mut TabEntry, target: &Rc<PaneInternals>) {
             &state.cwd,
         ));
     }
-    entry.tab_button = build_tab_button_from_label(&entry.title_label, &entry.id, target);
+    let (tab_button, unread_dot) =
+        build_tab_button_from_label(&entry.title_label, &entry.id, target);
+    entry.tab_button = tab_button;
+    entry.unread_dot = unread_dot;
     if entry.pinned {
         apply_pin_visuals(&entry.tab_button, true);
     }
+    entry.unread_dot.set_visible(entry.unread);
 }
 
 fn reorder_tab_to_index(
@@ -2709,6 +2905,7 @@ fn transfer_tab_between_panes(
             next_active_after_tab_removal(&all_ids, source_state.active_tab.as_deref(), source_idx);
         (source_state.tabs.remove(source_idx), next_active)
     };
+    let moved_was_unread = entry.unread;
 
     if let Some(window) = entry
         .content
@@ -2738,6 +2935,10 @@ fn transfer_tab_between_panes(
     }
     rebuild_tab_strip(&target.tab_strip, &target.tab_state);
 
+    if moved_was_unread {
+        (source.callbacks.on_unread_changed)();
+    }
+
     let source_empty = source.tab_state.borrow().tabs.is_empty();
     if source_empty {
         (source.callbacks.on_empty)(
@@ -2751,6 +2952,12 @@ fn transfer_tab_between_panes(
             &source.tab_state,
             &next_active,
         );
+        clear_tab_unread_if_visible(
+            &source.tab_state,
+            &next_active,
+            &source.pane_outer.clone().upcast(),
+            &source.callbacks,
+        );
     }
 
     activate_tab(
@@ -2759,6 +2966,17 @@ fn transfer_tab_between_panes(
         &target.tab_state,
         &moved_tab_id,
     );
+    let target_widget = target.pane_outer.clone().upcast();
+    if (target.callbacks.is_pane_visible)(&target_widget) {
+        clear_tab_unread_if_visible(
+            &target.tab_state,
+            &moved_tab_id,
+            &target_widget,
+            &target.callbacks,
+        );
+    } else if moved_was_unread {
+        (target.callbacks.on_unread_changed)();
+    }
     (target.callbacks.on_state_changed)();
     true
 }
@@ -2961,28 +3179,37 @@ fn activate_tab(
     tab_state: &Rc<RefCell<TabState>>,
     tab_id: &str,
 ) {
-    let mut ts = tab_state.borrow_mut();
-    ts.active_tab = Some(tab_id.to_string());
+    let (focus_target, has_content_child) = {
+        let mut ts = tab_state.borrow_mut();
+        ts.active_tab = Some(tab_id.to_string());
 
-    // Update visual state on all tabs
-    for entry in &ts.tabs {
-        if entry.id == tab_id {
-            entry.tab_button.add_css_class("limux-tab-active");
-        } else {
-            entry.tab_button.remove_css_class("limux-tab-active");
+        // Update visual state on all tabs
+        for entry in &ts.tabs {
+            if entry.id == tab_id {
+                entry.tab_button.add_css_class("limux-tab-active");
+            } else {
+                entry.tab_button.remove_css_class("limux-tab-active");
+            }
         }
-    }
 
-    if content_stack.child_by_name(tab_id).is_some() {
+        let focus_target = ts
+            .tabs
+            .iter()
+            .find(|entry| entry.id == tab_id)
+            .map(TabFocusTarget::from_entry);
+
+        (focus_target, content_stack.child_by_name(tab_id).is_some())
+        // `ts` (the RefCell borrow_mut guard) is dropped here, before we touch
+        // content_stack. set_visible_child_name() synchronously fires GTK
+        // unmap/map signals (hover-out on the old surface, etc.), and those
+        // handlers can re-enter tab_state.borrow() (e.g. tab_rename_active).
+        // Holding the mutable borrow across that call caused a double-borrow
+        // panic on rapid repeated tab switches (Ctrl+Tab x2-4 fast).
+    };
+
+    if has_content_child {
         content_stack.set_visible_child_name(tab_id);
     }
-
-    let focus_target = ts
-        .tabs
-        .iter()
-        .find(|entry| entry.id == tab_id)
-        .map(TabFocusTarget::from_entry);
-    drop(ts);
 
     if let Some(target) = focus_target {
         // Mouse-initiated tab switches can leave focus on the click target if we
@@ -3010,6 +3237,8 @@ fn remove_tab(
         return;
     };
     let entry = ts.tabs.remove(idx);
+    let removed_was_unread = entry.unread;
+    let closed_terminal = matches!(&entry.kind, TabKind::Terminal { .. });
 
     entry.prepare_for_removal();
     tab_strip.remove(&entry.tab_button);
@@ -3017,6 +3246,14 @@ fn remove_tab(
 
     if ts.tabs.is_empty() {
         drop(ts);
+        if removed_was_unread {
+            (callbacks.on_unread_changed)();
+        }
+        let empty_reason = if empty_reason == PaneEmptyReason::ClosedLastTab && closed_terminal {
+            PaneEmptyReason::ClosedLastTerminal
+        } else {
+            empty_reason
+        };
         (callbacks.on_empty)(&pane_outer.clone().upcast(), empty_reason);
         return;
     }
@@ -3029,6 +3266,10 @@ fn remove_tab(
 
     if was_active {
         activate_tab(tab_strip, content_stack, tab_state, &new_id);
+        clear_tab_unread_if_visible(tab_state, &new_id, &pane_outer.clone().upcast(), callbacks);
+    }
+    if removed_was_unread {
+        (callbacks.on_unread_changed)();
     }
     (callbacks.on_state_changed)();
 }
@@ -3724,19 +3965,35 @@ fn create_browser_widget(
 #[cfg(test)]
 mod tests {
     use super::{
-        classify_content_drop_zone, content_drop_preview_rect, effective_drop_target_dimensions,
-        is_localhost_input, is_safe_browser_url, next_active_after_tab_removal,
-        normalize_browser_entry_input, normalize_reorder_insert_index, pane_action_tooltip,
-        surface_hint_matches, ContentDropZone, TabDragPayload, BROWSER_SEARCH_ENTRY_CSS_CLASS,
-        BROWSER_SEARCH_ENTRY_CSS_CLASSES, BROWSER_URL_ENTRY_CSS_CLASS,
-        BROWSER_URL_ENTRY_CSS_CLASSES, HOST_ENTRY_CSS_CLASS, PANE_CSS, TAB_RENAME_ENTRY_CSS_CLASS,
-        TAB_RENAME_ENTRY_CSS_CLASSES,
+        classify_content_drop_zone, content_drop_preview_rect, display_terminal_title,
+        effective_drop_target_dimensions, is_localhost_input, is_safe_browser_url,
+        next_active_after_tab_removal, normalize_browser_entry_input,
+        normalize_reorder_insert_index, pane_action_tooltip, surface_hint_matches, ContentDropZone,
+        TabDragPayload, BROWSER_SEARCH_ENTRY_CSS_CLASS, BROWSER_SEARCH_ENTRY_CSS_CLASSES,
+        BROWSER_URL_ENTRY_CSS_CLASS, BROWSER_URL_ENTRY_CSS_CLASSES, HOST_ENTRY_CSS_CLASS, PANE_CSS,
+        TAB_RENAME_ENTRY_CSS_CLASS, TAB_RENAME_ENTRY_CSS_CLASSES,
     };
     #[cfg(feature = "webkit")]
     use super::{
         env_value_contains_token, is_kde_wayland_session_from_env, BROWSER_WEB_VIEW_CSS_CLASS,
     };
     use crate::shortcut_config::{default_shortcuts, resolve_shortcuts_from_str, ShortcutId};
+
+    #[test]
+    fn terminal_title_truncation_preserves_utf8_boundaries() {
+        let short_unicode = "12345678901234567890🚀x";
+        let long_unicode = "12345678901234567890🚀xyz";
+
+        assert_eq!(display_terminal_title(short_unicode), short_unicode);
+        assert_eq!(
+            display_terminal_title(long_unicode),
+            "12345678901234567890🚀…"
+        );
+        assert_eq!(
+            display_terminal_title("12345678901234567890123"),
+            "123456789012345678901…"
+        );
+    }
 
     #[test]
     fn pane_action_tooltip_reflects_remaps_and_unbinds() {
