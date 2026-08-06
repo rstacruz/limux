@@ -143,7 +143,11 @@ pub fn present_settings_dialog(parent: &impl IsA<gtk::Widget>, input: SettingsEd
     window.present();
 }
 
-fn apply_config_change<F, G>(config: &Rc<RefCell<AppConfig>>, on_changed: &F, update: G)
+fn apply_config_change<F, G>(
+    config: &Rc<RefCell<AppConfig>>,
+    on_changed: &F,
+    update: G,
+) -> AppConfig
 where
     F: Fn(&AppConfig, &AppConfig) + ?Sized,
     G: FnOnce(&mut AppConfig),
@@ -156,6 +160,7 @@ where
         (previous, updated)
     };
     on_changed(&previous, &updated);
+    config.borrow().clone()
 }
 
 fn build_settings_window_content(window: &adw::Window, input: SettingsEditorInput) -> gtk::Widget {
@@ -267,6 +272,38 @@ fn build_general_page(input: &SettingsEditorInput) -> gtk::Widget {
     hover_row.set_activatable_widget(Some(&hover_switch));
     group.add(&hover_row);
 
+    let workspace_path_row = adw::ActionRow::builder()
+        .title("Show workspace path")
+        .subtitle("Display workspace folder below its name")
+        .build();
+    workspace_path_row.set_title_lines(1);
+    workspace_path_row.set_subtitle_lines(2);
+    let workspace_path_switch = gtk::Switch::new();
+    workspace_path_switch.set_active(input.config.borrow().appearance.show_workspace_path);
+    workspace_path_switch.set_valign(gtk::Align::Center);
+    workspace_path_row.add_suffix(&workspace_path_switch);
+    workspace_path_row.set_activatable_widget(Some(&workspace_path_switch));
+    group.add(&workspace_path_row);
+
+    let keep_workspace_open_row = adw::ActionRow::builder()
+        .title("Keep workspace open")
+        .subtitle("Keep the workspace available after its final terminal exits")
+        .build();
+    keep_workspace_open_row.set_title_lines(1);
+    keep_workspace_open_row.set_subtitle_lines(2);
+    let keep_workspace_open_switch = gtk::Switch::new();
+    keep_workspace_open_switch.set_active(
+        input
+            .config
+            .borrow()
+            .workspace
+            .keep_open_after_last_terminal_closes,
+    );
+    keep_workspace_open_switch.set_valign(gtk::Align::Center);
+    keep_workspace_open_row.add_suffix(&keep_workspace_open_switch);
+    keep_workspace_open_row.set_activatable_widget(Some(&keep_workspace_open_switch));
+    group.add(&keep_workspace_open_row);
+
     let auto_copy_row = adw::ActionRow::builder()
         .title("Copy selection automatically")
         .subtitle("Copy selected terminal text to the regular clipboard")
@@ -349,6 +386,37 @@ fn build_general_page(input: &SettingsEditorInput) -> gtk::Widget {
             let hover_terminal_focus = switch.is_active();
             apply_config_change(&config, &*on_changed, move |c| {
                 c.focus.hover_terminal_focus = hover_terminal_focus;
+            });
+        });
+    }
+    {
+        let config = input.config.clone();
+        let on_changed = input.on_config_changed.clone();
+        let syncing = Rc::new(Cell::new(false));
+        workspace_path_switch.connect_active_notify(move |switch| {
+            if syncing.get() {
+                return;
+            }
+            let show_workspace_path = switch.is_active();
+            let effective = apply_config_change(&config, &*on_changed, move |c| {
+                c.appearance.show_workspace_path = show_workspace_path;
+            })
+            .appearance
+            .show_workspace_path;
+            if switch.is_active() != effective {
+                syncing.set(true);
+                switch.set_active(effective);
+                syncing.set(false);
+            }
+        });
+    }
+    {
+        let config = input.config.clone();
+        let on_changed = input.on_config_changed.clone();
+        keep_workspace_open_switch.connect_active_notify(move |switch| {
+            let keep_open = switch.is_active();
+            apply_config_change(&config, &*on_changed, move |c| {
+                c.workspace.keep_open_after_last_terminal_closes = keep_open;
             });
         });
     }
@@ -480,20 +548,21 @@ mod tests {
     use super::*;
 
     #[test]
-    fn apply_config_change_allows_reentrant_config_sync() {
+    fn apply_config_change_returns_reentrant_config_state() {
         let config = Rc::new(RefCell::new(AppConfig::default()));
 
-        apply_config_change(
+        let effective = apply_config_change(
             &config,
-            &|_previous, updated| {
-                config.borrow_mut().clone_from(updated);
+            &|previous, _updated| {
+                config.borrow_mut().clone_from(previous);
             },
             |current| {
                 current.focus.hover_terminal_focus = true;
             },
         );
 
-        assert!(config.borrow().focus.hover_terminal_focus);
+        assert!(!effective.focus.hover_terminal_focus);
+        assert!(!config.borrow().focus.hover_terminal_focus);
     }
 
     #[test]

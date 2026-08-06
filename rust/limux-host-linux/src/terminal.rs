@@ -11,7 +11,7 @@ use std::os::unix::ffi::OsStringExt;
 use std::ptr;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
 use limux_ghostty_sys::*;
@@ -60,6 +60,7 @@ const LINK_PREVIEW_CURSOR_Y_GAP: i32 = 14;
 
 /// Per-surface state, stored in a global registry keyed by surface pointer.
 struct SurfaceEntry {
+    identity: SurfaceIdentity,
     gl_area: gtk::GLArea,
     toast_overlay: gtk::Overlay,
     scrollbar: gtk::Scrollbar,
@@ -79,11 +80,14 @@ struct SurfaceEntry {
     link_popover: gtk::Popover,
     link_label: gtk::Label,
     cursor_pos: Rc<Cell<(f64, f64)>>,
+    mouse_cursor: Cell<MouseCursorState>,
 }
 
 struct ClipboardContext {
     surface: Cell<ghostty_surface_t>,
     copy_selection_to_clipboard: Rc<dyn Fn() -> bool>,
+    url_probe: RefCell<Option<String>>,
+    url_probe_active: Cell<bool>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -93,8 +97,122 @@ struct ClipboardWritePolicy {
     show_toast: bool,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct MouseCursorState {
+    shape: ghostty_action_mouse_shape_e,
+    visible: bool,
+}
+
+impl Default for MouseCursorState {
+    fn default() -> Self {
+        Self {
+            shape: GHOSTTY_MOUSE_SHAPE_TEXT,
+            visible: true,
+        }
+    }
+}
+
+impl MouseCursorState {
+    fn update_shape(self, shape: ghostty_action_mouse_shape_e) -> Self {
+        Self { shape, ..self }
+    }
+
+    fn update_visibility(self, visibility: ghostty_action_mouse_visibility_e) -> Self {
+        Self {
+            visible: visibility != GHOSTTY_MOUSE_HIDDEN,
+            ..self
+        }
+    }
+
+    fn gtk_cursor_name(self) -> &'static str {
+        if self.visible {
+            gtk_cursor_name_for_ghostty_shape(self.shape)
+        } else {
+            "none"
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum MouseCursorUpdate {
+    Shape(ghostty_action_mouse_shape_e),
+    Visibility(ghostty_action_mouse_visibility_e),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct SurfaceIdentity {
+    surface_key: usize,
+    generation: u64,
+}
+
+#[derive(Default)]
+struct SurfaceIdentityRegistry {
+    next_generation: u64,
+    active_generations: HashMap<usize, u64>,
+}
+
+impl SurfaceIdentityRegistry {
+    fn register(&mut self, surface_key: usize) -> SurfaceIdentity {
+        self.next_generation = self.next_generation.wrapping_add(1);
+        let identity = SurfaceIdentity {
+            surface_key,
+            generation: self.next_generation,
+        };
+        self.active_generations
+            .insert(surface_key, identity.generation);
+        identity
+    }
+
+    fn current(&self, surface_key: usize) -> Option<SurfaceIdentity> {
+        self.active_generations
+            .get(&surface_key)
+            .copied()
+            .map(|generation| SurfaceIdentity {
+                surface_key,
+                generation,
+            })
+    }
+
+    fn is_current(&self, identity: SurfaceIdentity) -> bool {
+        self.current(identity.surface_key) == Some(identity)
+    }
+
+    fn unregister(&mut self, identity: SurfaceIdentity) {
+        if self.is_current(identity) {
+            self.active_generations.remove(&identity.surface_key);
+        }
+    }
+}
+
 thread_local! {
     static SURFACE_MAP: RefCell<HashMap<usize, SurfaceEntry>> = RefCell::new(HashMap::new());
+}
+
+static SURFACE_IDENTITIES: OnceLock<Mutex<SurfaceIdentityRegistry>> = OnceLock::new();
+
+fn surface_identity_registry() -> &'static Mutex<SurfaceIdentityRegistry> {
+    SURFACE_IDENTITIES.get_or_init(|| Mutex::new(SurfaceIdentityRegistry::default()))
+}
+
+fn register_surface_identity(surface_key: usize) -> SurfaceIdentity {
+    surface_identity_registry()
+        .lock()
+        .expect("surface identity registry poisoned")
+        .register(surface_key)
+}
+
+fn current_surface_identity(surface_key: usize) -> Option<SurfaceIdentity> {
+    surface_identity_registry()
+        .lock()
+        .expect("surface identity registry poisoned")
+        .current(surface_key)
+}
+
+fn unregister_surface_identity(identity: SurfaceIdentity) {
+    surface_identity_registry()
+        .lock()
+        .expect("surface identity registry poisoned")
+        .unregister(identity);
 }
 
 #[derive(Clone)]
@@ -180,20 +298,50 @@ impl TerminalHandle {
             return false;
         };
 
-        let press = translate_key_event(
+        // A key needs BOTH halves, and supplying only one drops it silently.
+        //
+        // `keycode` — ghostty resolves the *physical* key from the hardware keycode
+        // and does not fall back to the keyval. With `keycode: 0` it sees an
+        // unidentified key and drops the event, so Enter, arrows, F-keys and
+        // ctrl-chords never reach the PTY.
+        //
+        // `text` — ghostty writes ordinary printable input from the text field, not
+        // from the keycode (see the comment on the GTK key controller below: "Ghostty
+        // uses the text field for actual character input and the keycode for
+        // bindings"). With `text` null, `send-key a` is encoded as a keypress that
+        // produces no character, so it too vanishes.
+        //
+        // The GTK path gets `text` from the input method; a socket-injected key has
+        // no IM behind it, so derive it here the same way GTK's fallback does.
+        // `key_event_text` returns None for control characters, which is what we want:
+        // Enter and ctrl-chords must be *encoded* by ghostty from the key + mods, not
+        // written as literal bytes.
+        let keycode = keycode_for_keyval(self.gl_area.upcast_ref(), keyval);
+        let text_keyval =
+            translated_keyval_for_keycode(self.gl_area.upcast_ref(), keyval, keycode, modifier);
+        let text = key_event_text(text_keyval);
+
+        let mut press = translate_key_event(
             GHOSTTY_ACTION_PRESS,
             Some(self.gl_area.upcast_ref()),
             None,
             keyval,
-            0,
+            keycode,
             modifier,
         );
+        // The CString must outlive the ghostty call below; `text` owns it until the
+        // end of this function.
+        if let Some(text) = text.as_ref() {
+            press.text = text.as_ptr();
+        }
+
+        // Release carries no text, matching the GTK controller.
         let release = translate_key_event(
             GHOSTTY_ACTION_RELEASE,
             Some(self.gl_area.upcast_ref()),
             None,
             keyval,
-            0,
+            keycode,
             modifier,
         );
 
@@ -201,6 +349,7 @@ impl TerminalHandle {
             ghostty_surface_key(surface, press);
             ghostty_surface_key(surface, release);
         }
+        drop(text);
         true
     }
 
@@ -511,6 +660,84 @@ fn current_ghostty_color_scheme() -> c_int {
     CURRENT_COLOR_SCHEME.load(Ordering::Relaxed)
 }
 
+fn gtk_cursor_name_for_ghostty_shape(shape: ghostty_action_mouse_shape_e) -> &'static str {
+    match shape {
+        GHOSTTY_MOUSE_SHAPE_DEFAULT => "default",
+        GHOSTTY_MOUSE_SHAPE_CONTEXT_MENU => "context-menu",
+        GHOSTTY_MOUSE_SHAPE_HELP => "help",
+        GHOSTTY_MOUSE_SHAPE_POINTER => "pointer",
+        GHOSTTY_MOUSE_SHAPE_PROGRESS => "progress",
+        GHOSTTY_MOUSE_SHAPE_WAIT => "wait",
+        GHOSTTY_MOUSE_SHAPE_CELL => "cell",
+        GHOSTTY_MOUSE_SHAPE_CROSSHAIR => "crosshair",
+        GHOSTTY_MOUSE_SHAPE_TEXT => "text",
+        GHOSTTY_MOUSE_SHAPE_VERTICAL_TEXT => "vertical-text",
+        GHOSTTY_MOUSE_SHAPE_ALIAS => "alias",
+        GHOSTTY_MOUSE_SHAPE_COPY => "copy",
+        GHOSTTY_MOUSE_SHAPE_MOVE => "move",
+        GHOSTTY_MOUSE_SHAPE_NO_DROP => "no-drop",
+        GHOSTTY_MOUSE_SHAPE_NOT_ALLOWED => "not-allowed",
+        GHOSTTY_MOUSE_SHAPE_GRAB => "grab",
+        GHOSTTY_MOUSE_SHAPE_GRABBING => "grabbing",
+        GHOSTTY_MOUSE_SHAPE_ALL_SCROLL => "all-scroll",
+        GHOSTTY_MOUSE_SHAPE_COL_RESIZE => "col-resize",
+        GHOSTTY_MOUSE_SHAPE_ROW_RESIZE => "row-resize",
+        GHOSTTY_MOUSE_SHAPE_N_RESIZE => "n-resize",
+        GHOSTTY_MOUSE_SHAPE_E_RESIZE => "e-resize",
+        GHOSTTY_MOUSE_SHAPE_S_RESIZE => "s-resize",
+        GHOSTTY_MOUSE_SHAPE_W_RESIZE => "w-resize",
+        GHOSTTY_MOUSE_SHAPE_NE_RESIZE => "ne-resize",
+        GHOSTTY_MOUSE_SHAPE_NW_RESIZE => "nw-resize",
+        GHOSTTY_MOUSE_SHAPE_SE_RESIZE => "se-resize",
+        GHOSTTY_MOUSE_SHAPE_SW_RESIZE => "sw-resize",
+        GHOSTTY_MOUSE_SHAPE_EW_RESIZE => "ew-resize",
+        GHOSTTY_MOUSE_SHAPE_NS_RESIZE => "ns-resize",
+        GHOSTTY_MOUSE_SHAPE_NESW_RESIZE => "nesw-resize",
+        GHOSTTY_MOUSE_SHAPE_NWSE_RESIZE => "nwse-resize",
+        GHOSTTY_MOUSE_SHAPE_ZOOM_IN => "zoom-in",
+        GHOSTTY_MOUSE_SHAPE_ZOOM_OUT => "zoom-out",
+        _ => "default",
+    }
+}
+
+fn set_gtk_mouse_cursor(widget: &impl IsA<gtk::Widget>, state: MouseCursorState) {
+    widget.set_cursor_from_name(Some(state.gtk_cursor_name()));
+}
+
+fn apply_mouse_cursor_update(identity: SurfaceIdentity, update: MouseCursorUpdate) {
+    SURFACE_MAP.with(|map| {
+        let map = map.borrow();
+        let Some(entry) = map.get(&identity.surface_key) else {
+            return;
+        };
+        if entry.identity != identity {
+            return;
+        }
+        let state = match update {
+            MouseCursorUpdate::Shape(shape) => entry.mouse_cursor.get().update_shape(shape),
+            MouseCursorUpdate::Visibility(visibility) => {
+                entry.mouse_cursor.get().update_visibility(visibility)
+            }
+        };
+        entry.mouse_cursor.set(state);
+        set_gtk_mouse_cursor(&entry.gl_area, state);
+    });
+}
+
+fn dispatch_mouse_cursor_update(surface_key: usize, update: MouseCursorUpdate) {
+    let Some(identity) = current_surface_identity(surface_key) else {
+        return;
+    };
+
+    if glib::MainContext::default().is_owner() {
+        apply_mouse_cursor_update(identity, update);
+    } else {
+        // Capture copied payload and surface generation. GTK access happens
+        // later, only if this pointer still identifies the same surface.
+        glib::idle_add_once(move || apply_mouse_cursor_update(identity, update));
+    }
+}
+
 pub fn sync_color_scheme(dark: bool) {
     let scheme = ghostty_color_scheme_for_dark_mode(dark);
     CURRENT_COLOR_SCHEME.store(scheme, Ordering::Relaxed);
@@ -667,6 +894,25 @@ unsafe extern "C" fn ghostty_action_cb(
                         }
                     });
                 }
+            }
+            true
+        }
+        GHOSTTY_ACTION_MOUSE_SHAPE => {
+            if target.tag == GHOSTTY_TARGET_SURFACE {
+                let surface_key = unsafe { target.target.surface } as usize;
+                let shape = unsafe { action.action.mouse_shape };
+                dispatch_mouse_cursor_update(surface_key, MouseCursorUpdate::Shape(shape));
+            }
+            true
+        }
+        GHOSTTY_ACTION_MOUSE_VISIBILITY => {
+            if target.tag == GHOSTTY_TARGET_SURFACE {
+                let surface_key = unsafe { target.target.surface } as usize;
+                let visibility = unsafe { action.action.mouse_visibility };
+                dispatch_mouse_cursor_update(
+                    surface_key,
+                    MouseCursorUpdate::Visibility(visibility),
+                );
             }
             true
         }
@@ -976,6 +1222,13 @@ unsafe extern "C" fn ghostty_write_clipboard_cb(
         .unwrap_or("")
         .to_string();
 
+    if let Some(context) = unsafe { clipboard_context_from_userdata(userdata) } {
+        if context.url_probe_active.get() {
+            *context.url_probe.borrow_mut() = Some(text);
+            return;
+        }
+    }
+
     let display = match gtk::gdk::Display::default() {
         Some(d) => d,
         None => return,
@@ -1112,6 +1365,7 @@ pub fn create_terminal(
     gl_area.set_auto_render(true);
     gl_area.set_focusable(true);
     gl_area.set_can_focus(true);
+    set_gtk_mouse_cursor(&gl_area, MouseCursorState::default());
     let wd = working_directory.map(|s| s.to_string());
     let saved_font_size = options.saved_font_size;
     let startup_command = options.startup_command;
@@ -1262,6 +1516,8 @@ pub fn create_terminal(
             let clipboard_context = Box::into_raw(Box::new(ClipboardContext {
                 surface: Cell::new(ptr::null_mut()),
                 copy_selection_to_clipboard: copy_selection_to_clipboard.clone(),
+                url_probe: RefCell::new(None),
+                url_probe_active: Cell::new(false),
             }));
             config.platform_tag = GHOSTTY_PLATFORM_LINUX;
             config.platform = ghostty_platform_u {
@@ -1322,6 +1578,8 @@ pub fn create_terminal(
                 eprintln!("limux: failed to create ghostty surface");
                 return;
             }
+            let surface_key = surface as usize;
+            let surface_identity = register_surface_identity(surface_key);
             unsafe {
                 (*clipboard_context).surface.set(surface);
                 ghostty_surface_set_color_scheme(surface, current_ghostty_color_scheme());
@@ -1349,11 +1607,11 @@ pub fn create_terminal(
                 refresh_surface_display(surface, gl_area);
             }
 
-            let surface_key = surface as usize;
             SURFACE_MAP.with(|map| {
                 map.borrow_mut().insert(
                     surface_key,
                     SurfaceEntry {
+                        identity: surface_identity,
                         gl_area: gl.clone(),
                         toast_overlay: overlay_for_map.clone(),
                         scrollbar: scrollbar_for_map.clone(),
@@ -1406,6 +1664,7 @@ pub fn create_terminal(
                         link_popover: link_popover_for_map.clone(),
                         link_label: link_label_for_map.clone(),
                         cursor_pos: cursor_pos_for_map.clone(),
+                        mouse_cursor: Cell::new(MouseCursorState::default()),
                     },
                 );
             });
@@ -1619,7 +1878,8 @@ pub fn create_terminal(
         right_click.set_button(3);
         right_click.connect_pressed(move |gesture, _n, x, y| {
             let surface = *sc.borrow();
-            show_terminal_context_menu(&gl, &overlay, surface, &callbacks, x, y);
+            let mods = translate_mouse_mods(gesture.current_event_state());
+            show_terminal_context_menu(&gl, &overlay, surface, &callbacks, x, y, mods);
             gesture.set_state(gtk::EventSequenceState::Claimed);
         });
         gl_area.add_controller(right_click);
@@ -1772,6 +2032,7 @@ pub fn create_terminal(
                 let surface_key = surface as usize;
                 SURFACE_MAP.with(|map| {
                     if let Some(entry) = map.borrow_mut().remove(&surface_key) {
+                        unregister_surface_identity(entry.identity);
                         unsafe {
                             drop(Box::from_raw(entry.clipboard_context));
                         }
@@ -1823,6 +2084,51 @@ fn surface_action(surface: Option<ghostty_surface_t>, action: &str) {
     }
 }
 
+fn url_at_position(
+    surface: Option<ghostty_surface_t>,
+    x: f64,
+    y: f64,
+    restore_mods: c_int,
+) -> Option<String> {
+    let surface = surface?;
+    // Mouse-position callbacks become terminal input while a TUI has mouse
+    // reporting enabled, so probing there would alter terminal state.
+    if unsafe { ghostty_surface_mouse_captured(surface) } {
+        return None;
+    }
+    let clipboard_context = SURFACE_MAP.with(|map| {
+        map.borrow()
+            .get(&(surface as usize))
+            .map(|entry| entry.clipboard_context)
+    })?;
+    let context = unsafe { clipboard_context.as_ref() }?;
+
+    context.url_probe_active.set(true);
+
+    // Let Ghostty resolve OSC 8 targets and wrapped URLs. Leave and re-enter
+    // because embedded surfaces deduplicate same-position moves.
+    *context.url_probe.borrow_mut() = None;
+    unsafe {
+        ghostty_surface_mouse_pos(surface, -1.0, -1.0, GHOSTTY_MODS_CTRL);
+        ghostty_surface_mouse_pos(surface, x, y, GHOSTTY_MODS_CTRL);
+    }
+    surface_action(Some(surface), "copy_url_to_clipboard");
+    let url = context.url_probe.borrow_mut().take();
+    context.url_probe_active.set(false);
+
+    unsafe {
+        ghostty_surface_mouse_pos(surface, -1.0, -1.0, restore_mods);
+        ghostty_surface_mouse_pos(surface, x, y, restore_mods);
+    }
+    SURFACE_MAP.with(|map| {
+        if let Some(entry) = map.borrow().get(&(surface as usize)) {
+            entry.link_popover.popdown();
+        }
+    });
+
+    url
+}
+
 fn copy_text_to_clipboards(text: &str) {
     if let Some(display) = gtk::gdk::Display::default() {
         display.clipboard().set_text(text);
@@ -1864,15 +2170,20 @@ fn show_terminal_context_menu(
     callbacks: &Rc<RefCell<TerminalCallbacks>>,
     x: f64,
     y: f64,
+    mods: c_int,
 ) {
     let menu_box = build_popover_inner_box();
+    let url = url_at_position(surface, x, y, mods);
 
     let has_selection = surface
         .map(|s| unsafe { ghostty_surface_has_selection(s) })
         .unwrap_or(false);
 
-    let items: Vec<(&str, bool)> = vec![
-        ("Copy", has_selection),
+    let mut items: Vec<(&str, bool)> = vec![("Copy", has_selection)];
+    if url.is_some() {
+        items.push(("Copy URL", true));
+    }
+    items.extend([
         ("Paste", true),
         ("---", false),
         ("IDs", true),
@@ -1883,7 +2194,7 @@ fn show_terminal_context_menu(
         ("Keybinds", true),
         ("---", false),
         ("Clear", true),
-    ];
+    ]);
 
     let identity = (callbacks.borrow().identity)();
     let ids_popover = gtk::Popover::new();
@@ -1951,6 +2262,8 @@ fn show_terminal_context_menu(
             let pop = popover.clone();
             let cb = callbacks.clone();
             let gl_area = gl_area.clone();
+            let url = url.clone();
+            let overlay = overlay.clone();
 
             btn.connect_clicked(move |_| {
                 if label == "IDs >" {
@@ -1959,6 +2272,12 @@ fn show_terminal_context_menu(
                 pop.popdown();
                 match label.as_str() {
                     "Copy" => surface_action(surface, "copy_to_clipboard"),
+                    "Copy URL" => {
+                        if let Some(url) = url.as_deref() {
+                            copy_text_to_clipboards(url);
+                            show_clipboard_toast(&overlay);
+                        }
+                    }
                     "Paste" => surface_action(surface, "paste_from_clipboard"),
                     "Browser" => {
                         let callbacks = cb.borrow();
@@ -2071,6 +2390,49 @@ fn translate_key_event(
         unshifted_codepoint: unshifted,
         composing: false,
     }
+}
+
+/// Map a keyval back to a hardware keycode via the display's keymap.
+///
+/// Real key events arrive from GTK with the keycode already filled in. Keys
+/// injected through the control socket only have a keyval (parsed from a string
+/// like `enter`), so we have to ask the keymap for the physical key that
+/// produces it. Returns 0 when the keyval isn't on the current layout, which
+/// preserves the previous behaviour rather than inventing a wrong key.
+fn keycode_for_keyval(widget: &gtk::Widget, keyval: gtk::gdk::Key) -> u32 {
+    widget
+        .display()
+        .map_keyval(keyval)
+        .and_then(|keys| keys.first().map(|key| key.keycode()))
+        .unwrap_or(0)
+}
+
+fn translated_keyval_for_keycode(
+    widget: &gtk::Widget,
+    keyval: gtk::gdk::Key,
+    keycode: u32,
+    modifier: gtk::gdk::ModifierType,
+) -> gtk::gdk::Key {
+    if keycode == 0 || !modifier.contains(gtk::gdk::ModifierType::SHIFT_MASK) {
+        return keyval;
+    }
+
+    let display = widget.display();
+    let group = display
+        .map_keyval(keyval)
+        .and_then(|mappings| {
+            mappings
+                .iter()
+                .find(|mapping| mapping.keycode() == keycode)
+                .or_else(|| mappings.first())
+                .map(|mapping| mapping.group())
+        })
+        .unwrap_or(0);
+
+    display
+        .translate_key(keycode, modifier, group)
+        .map(|(translated, _, _, _)| translated)
+        .unwrap_or(keyval)
 }
 
 fn key_event_text(keyval: gtk::gdk::Key) -> Option<CString> {
@@ -2309,6 +2671,84 @@ mod tests {
     }
 
     #[test]
+    fn maps_ghostty_mouse_shapes_to_gtk_cursor_names() {
+        let cases = [
+            (GHOSTTY_MOUSE_SHAPE_DEFAULT, "default"),
+            (GHOSTTY_MOUSE_SHAPE_CONTEXT_MENU, "context-menu"),
+            (GHOSTTY_MOUSE_SHAPE_HELP, "help"),
+            (GHOSTTY_MOUSE_SHAPE_POINTER, "pointer"),
+            (GHOSTTY_MOUSE_SHAPE_PROGRESS, "progress"),
+            (GHOSTTY_MOUSE_SHAPE_WAIT, "wait"),
+            (GHOSTTY_MOUSE_SHAPE_CELL, "cell"),
+            (GHOSTTY_MOUSE_SHAPE_CROSSHAIR, "crosshair"),
+            (GHOSTTY_MOUSE_SHAPE_TEXT, "text"),
+            (GHOSTTY_MOUSE_SHAPE_VERTICAL_TEXT, "vertical-text"),
+            (GHOSTTY_MOUSE_SHAPE_ALIAS, "alias"),
+            (GHOSTTY_MOUSE_SHAPE_COPY, "copy"),
+            (GHOSTTY_MOUSE_SHAPE_MOVE, "move"),
+            (GHOSTTY_MOUSE_SHAPE_NO_DROP, "no-drop"),
+            (GHOSTTY_MOUSE_SHAPE_NOT_ALLOWED, "not-allowed"),
+            (GHOSTTY_MOUSE_SHAPE_GRAB, "grab"),
+            (GHOSTTY_MOUSE_SHAPE_GRABBING, "grabbing"),
+            (GHOSTTY_MOUSE_SHAPE_ALL_SCROLL, "all-scroll"),
+            (GHOSTTY_MOUSE_SHAPE_COL_RESIZE, "col-resize"),
+            (GHOSTTY_MOUSE_SHAPE_ROW_RESIZE, "row-resize"),
+            (GHOSTTY_MOUSE_SHAPE_N_RESIZE, "n-resize"),
+            (GHOSTTY_MOUSE_SHAPE_E_RESIZE, "e-resize"),
+            (GHOSTTY_MOUSE_SHAPE_S_RESIZE, "s-resize"),
+            (GHOSTTY_MOUSE_SHAPE_W_RESIZE, "w-resize"),
+            (GHOSTTY_MOUSE_SHAPE_NE_RESIZE, "ne-resize"),
+            (GHOSTTY_MOUSE_SHAPE_NW_RESIZE, "nw-resize"),
+            (GHOSTTY_MOUSE_SHAPE_SE_RESIZE, "se-resize"),
+            (GHOSTTY_MOUSE_SHAPE_SW_RESIZE, "sw-resize"),
+            (GHOSTTY_MOUSE_SHAPE_EW_RESIZE, "ew-resize"),
+            (GHOSTTY_MOUSE_SHAPE_NS_RESIZE, "ns-resize"),
+            (GHOSTTY_MOUSE_SHAPE_NESW_RESIZE, "nesw-resize"),
+            (GHOSTTY_MOUSE_SHAPE_NWSE_RESIZE, "nwse-resize"),
+            (GHOSTTY_MOUSE_SHAPE_ZOOM_IN, "zoom-in"),
+            (GHOSTTY_MOUSE_SHAPE_ZOOM_OUT, "zoom-out"),
+        ];
+
+        for (shape, expected) in cases {
+            assert_eq!(gtk_cursor_name_for_ghostty_shape(shape), expected);
+        }
+        assert_eq!(gtk_cursor_name_for_ghostty_shape(c_int::MAX), "default");
+    }
+
+    #[test]
+    fn mouse_visibility_restores_latest_shape_and_treats_unknown_as_visible() {
+        let state = MouseCursorState::default()
+            .update_shape(GHOSTTY_MOUSE_SHAPE_POINTER)
+            .update_visibility(GHOSTTY_MOUSE_HIDDEN);
+        assert_eq!(state.gtk_cursor_name(), "none");
+
+        let state = state
+            .update_shape(GHOSTTY_MOUSE_SHAPE_WAIT)
+            .update_visibility(GHOSTTY_MOUSE_VISIBLE);
+        assert_eq!(state.gtk_cursor_name(), "wait");
+
+        let state = state.update_visibility(c_int::MAX);
+        assert!(state.visible);
+        assert_eq!(state.gtk_cursor_name(), "wait");
+    }
+
+    #[test]
+    fn surface_generation_rejects_queued_cursor_update_after_address_reuse() {
+        let mut registry = SurfaceIdentityRegistry::default();
+        let surface_key = 0x1234;
+        let original = registry.register(surface_key);
+        let queued_update = registry.current(surface_key).unwrap();
+
+        registry.unregister(original);
+        let replacement = registry.register(surface_key);
+
+        assert_eq!(queued_update.surface_key, replacement.surface_key);
+        assert_ne!(queued_update.generation, replacement.generation);
+        assert!(!registry.is_current(queued_update));
+        assert!(registry.is_current(replacement));
+    }
+
+    #[test]
     fn fallback_unshifted_codepoint_maps_shifted_symbols() {
         assert_eq!(
             fallback_unshifted_codepoint(gtk::gdk::Key::exclam),
@@ -2367,6 +2807,53 @@ mod tests {
         assert_eq!(ctrl_shift_h.as_deref(), Some("H"));
         assert_eq!(alt_shift_gt.as_deref(), Some(">"));
         assert!(key_event_text(gtk::gdk::Key::BackSpace).is_none());
+    }
+
+    /// The contract `send-key` depends on, in one place.
+    ///
+    /// A socket-injected key needs BOTH the hardware keycode and, for printable
+    /// input, the text field. Supplying only one drops the key silently:
+    ///
+    ///   * keycode only -> `send-key a` returns OK and writes nothing.
+    ///   * text only    -> Enter/arrows/ctrl-chords cannot be encoded at all.
+    ///
+    /// `key_event_text` is what decides which keys carry text, so pin its behaviour
+    /// for each of the three classes.
+    #[test]
+    fn send_key_text_is_supplied_for_printables_and_withheld_from_control_keys() {
+        // Printable: ghostty writes these from the text field.
+        for (key, expected) in [
+            (gtk::gdk::Key::a, "a"),
+            (gtk::gdk::Key::A, "A"),
+            (gtk::gdk::Key::_1, "1"),
+            (gtk::gdk::Key::space, " "),
+        ] {
+            let text = key_event_text(key).and_then(|s| s.into_string().ok());
+            assert_eq!(
+                text.as_deref(),
+                Some(expected),
+                "printable key must carry text or it is dropped"
+            );
+        }
+
+        // Control keys: text must be WITHHELD so ghostty encodes them from the
+        // key + mods. Writing "\r" as literal text instead of letting ghostty encode
+        // Return is how you break the kitty keyboard protocol.
+        for key in [
+            gtk::gdk::Key::Return,
+            gtk::gdk::Key::Tab,
+            gtk::gdk::Key::Escape,
+            gtk::gdk::Key::BackSpace,
+        ] {
+            assert!(
+                key_event_text(key).is_none(),
+                "{key:?} must be encoded by ghostty, not written as literal text"
+            );
+        }
+
+        // Non-textual keys have no unicode at all.
+        assert!(key_event_text(gtk::gdk::Key::Up).is_none());
+        assert!(key_event_text(gtk::gdk::Key::F1).is_none());
     }
 
     #[test]

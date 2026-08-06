@@ -207,6 +207,21 @@ impl SplitTreeContainer {
         }
     }
 
+    pub(crate) fn reveal_pane(self: &Rc<Self>, target: &gtk::Widget) -> bool {
+        let should_restore = self
+            .zoomed_pane
+            .borrow()
+            .as_ref()
+            .is_some_and(|zoomed| zoomed != target);
+        if !should_restore {
+            return false;
+        }
+        self.zoomed_pane.borrow_mut().take();
+        *self.last_focused.borrow_mut() = Some(target.clone());
+        self.trigger_rebuild();
+        true
+    }
+
     fn zoom_pane(self: &Rc<Self>, target: &gtk::Widget) {
         self.save_focus();
         *self.zoomed_pane.borrow_mut() = Some(target.clone());

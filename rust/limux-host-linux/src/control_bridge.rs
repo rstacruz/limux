@@ -168,10 +168,10 @@ pub enum ControlCommand {
         reply: mpsc::Sender<BridgeResult>,
     },
     /// Post a desktop-style notification into the sidebar + toast overlay.
-    /// `target` chooses the workspace to flag as unread; if not provided,
-    /// the currently-active workspace is used.
+    /// `target` chooses the workspace; `surface_hint` identifies the tab when available.
     CreateNotification {
         target: WorkspaceTarget,
+        surface_hint: Option<String>,
         title: String,
         subtitle: String,
         body: String,
@@ -664,6 +664,7 @@ fn handle_method(
             (
                 ControlCommand::CreateNotification {
                     target,
+                    surface_hint: optional_string(params, &["surface_id", "tab_id"]),
                     title,
                     subtitle,
                     body,
@@ -1016,5 +1017,30 @@ mod tests {
 
         assert_eq!(response.error, None);
         assert_eq!(response.result.expect("result")["text"], "ready");
+    }
+
+    #[test]
+    fn notification_route_preserves_surface_target() {
+        let response = dispatch_request(
+            r#"{"id":1,"method":"notification.create","params":{"workspace_id":"codex","surface_id":"surface:9:tab","title":"Done"}}"#,
+            &|command| match command {
+                ControlCommand::CreateNotification {
+                    target,
+                    surface_hint,
+                    title,
+                    reply,
+                    ..
+                } => {
+                    assert_eq!(target, WorkspaceTarget::Name("codex".to_string()));
+                    assert_eq!(surface_hint, Some("surface:9:tab".to_string()));
+                    assert_eq!(title, "Done");
+                    let _ = reply.send(Ok(json!({ "ok": true })));
+                }
+                other => panic!("unexpected command: {other:?}"),
+            },
+        );
+
+        assert_eq!(response.error, None);
+        assert_eq!(response.result.expect("result")["ok"], true);
     }
 }

@@ -77,6 +77,7 @@ pub const GHOSTTY_ACTION_DESKTOP_NOTIFICATION: c_int = 31;
 pub const GHOSTTY_ACTION_SET_TITLE: c_int = 32;
 pub const GHOSTTY_ACTION_PWD: c_int = 34;
 pub const GHOSTTY_ACTION_MOUSE_SHAPE: c_int = 35;
+pub const GHOSTTY_ACTION_MOUSE_VISIBILITY: c_int = 36;
 pub const GHOSTTY_ACTION_MOUSE_OVER_LINK: c_int = 37;
 pub const GHOSTTY_ACTION_COLOR_CHANGE: c_int = 45;
 pub const GHOSTTY_ACTION_RELOAD_CONFIG: c_int = 46;
@@ -85,6 +86,48 @@ pub const GHOSTTY_ACTION_CLOSE_WINDOW: c_int = 48;
 pub const GHOSTTY_ACTION_RING_BELL: c_int = 49;
 pub const GHOSTTY_ACTION_OPEN_URL: c_int = 53;
 pub const GHOSTTY_ACTION_SHOW_CHILD_EXITED: c_int = 54;
+
+pub type ghostty_action_mouse_shape_e = c_int;
+
+pub const GHOSTTY_MOUSE_SHAPE_DEFAULT: ghostty_action_mouse_shape_e = 0;
+pub const GHOSTTY_MOUSE_SHAPE_CONTEXT_MENU: ghostty_action_mouse_shape_e = 1;
+pub const GHOSTTY_MOUSE_SHAPE_HELP: ghostty_action_mouse_shape_e = 2;
+pub const GHOSTTY_MOUSE_SHAPE_POINTER: ghostty_action_mouse_shape_e = 3;
+pub const GHOSTTY_MOUSE_SHAPE_PROGRESS: ghostty_action_mouse_shape_e = 4;
+pub const GHOSTTY_MOUSE_SHAPE_WAIT: ghostty_action_mouse_shape_e = 5;
+pub const GHOSTTY_MOUSE_SHAPE_CELL: ghostty_action_mouse_shape_e = 6;
+pub const GHOSTTY_MOUSE_SHAPE_CROSSHAIR: ghostty_action_mouse_shape_e = 7;
+pub const GHOSTTY_MOUSE_SHAPE_TEXT: ghostty_action_mouse_shape_e = 8;
+pub const GHOSTTY_MOUSE_SHAPE_VERTICAL_TEXT: ghostty_action_mouse_shape_e = 9;
+pub const GHOSTTY_MOUSE_SHAPE_ALIAS: ghostty_action_mouse_shape_e = 10;
+pub const GHOSTTY_MOUSE_SHAPE_COPY: ghostty_action_mouse_shape_e = 11;
+pub const GHOSTTY_MOUSE_SHAPE_MOVE: ghostty_action_mouse_shape_e = 12;
+pub const GHOSTTY_MOUSE_SHAPE_NO_DROP: ghostty_action_mouse_shape_e = 13;
+pub const GHOSTTY_MOUSE_SHAPE_NOT_ALLOWED: ghostty_action_mouse_shape_e = 14;
+pub const GHOSTTY_MOUSE_SHAPE_GRAB: ghostty_action_mouse_shape_e = 15;
+pub const GHOSTTY_MOUSE_SHAPE_GRABBING: ghostty_action_mouse_shape_e = 16;
+pub const GHOSTTY_MOUSE_SHAPE_ALL_SCROLL: ghostty_action_mouse_shape_e = 17;
+pub const GHOSTTY_MOUSE_SHAPE_COL_RESIZE: ghostty_action_mouse_shape_e = 18;
+pub const GHOSTTY_MOUSE_SHAPE_ROW_RESIZE: ghostty_action_mouse_shape_e = 19;
+pub const GHOSTTY_MOUSE_SHAPE_N_RESIZE: ghostty_action_mouse_shape_e = 20;
+pub const GHOSTTY_MOUSE_SHAPE_E_RESIZE: ghostty_action_mouse_shape_e = 21;
+pub const GHOSTTY_MOUSE_SHAPE_S_RESIZE: ghostty_action_mouse_shape_e = 22;
+pub const GHOSTTY_MOUSE_SHAPE_W_RESIZE: ghostty_action_mouse_shape_e = 23;
+pub const GHOSTTY_MOUSE_SHAPE_NE_RESIZE: ghostty_action_mouse_shape_e = 24;
+pub const GHOSTTY_MOUSE_SHAPE_NW_RESIZE: ghostty_action_mouse_shape_e = 25;
+pub const GHOSTTY_MOUSE_SHAPE_SE_RESIZE: ghostty_action_mouse_shape_e = 26;
+pub const GHOSTTY_MOUSE_SHAPE_SW_RESIZE: ghostty_action_mouse_shape_e = 27;
+pub const GHOSTTY_MOUSE_SHAPE_EW_RESIZE: ghostty_action_mouse_shape_e = 28;
+pub const GHOSTTY_MOUSE_SHAPE_NS_RESIZE: ghostty_action_mouse_shape_e = 29;
+pub const GHOSTTY_MOUSE_SHAPE_NESW_RESIZE: ghostty_action_mouse_shape_e = 30;
+pub const GHOSTTY_MOUSE_SHAPE_NWSE_RESIZE: ghostty_action_mouse_shape_e = 31;
+pub const GHOSTTY_MOUSE_SHAPE_ZOOM_IN: ghostty_action_mouse_shape_e = 32;
+pub const GHOSTTY_MOUSE_SHAPE_ZOOM_OUT: ghostty_action_mouse_shape_e = 33;
+
+pub type ghostty_action_mouse_visibility_e = c_int;
+
+pub const GHOSTTY_MOUSE_VISIBLE: ghostty_action_mouse_visibility_e = 0;
+pub const GHOSTTY_MOUSE_HIDDEN: ghostty_action_mouse_visibility_e = 1;
 
 // Key codes (W3C UIEvents, subset)
 pub const GHOSTTY_KEY_UNIDENTIFIED: c_int = 0;
@@ -327,6 +370,8 @@ pub union ghostty_action_u {
     pub set_title: ghostty_action_set_title_s,
     pub pwd: ghostty_action_pwd_s,
     pub open_url: ghostty_action_open_url_s,
+    pub mouse_shape: ghostty_action_mouse_shape_e,
+    pub mouse_visibility: ghostty_action_mouse_visibility_e,
     pub mouse_over_link: ghostty_action_mouse_over_link_s,
     pub child_exited: ghostty_surface_message_childexited_s,
     _padding: [u8; 24],
@@ -483,6 +528,7 @@ extern "C" {
         button: c_int,
         mods: c_int,
     ) -> bool;
+    pub fn ghostty_surface_mouse_captured(surface: ghostty_surface_t) -> bool;
     pub fn ghostty_surface_mouse_pos(surface: ghostty_surface_t, x: f64, y: f64, mods: c_int);
     pub fn ghostty_surface_mouse_scroll(surface: ghostty_surface_t, x: f64, y: f64, mods: c_int);
     pub fn ghostty_surface_ime_point(

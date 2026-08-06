@@ -12,7 +12,7 @@ jobs:
 
     steps:
       - name: Check out repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           submodules: recursive
 
@@ -45,3 +45,49 @@ jobs:
 
       - name: Run repository quality checks
         run: ./scripts/check.sh
+
+  gtk-host-smoke:
+    name: GTK host smoke
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+        with:
+          submodules: recursive
+
+      - name: Install Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.15.2
+
+      - name: Install stable Rust
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            blueprint-compiler \
+            build-essential \
+            jq \
+            libadwaita-1-dev \
+            libepoxy-dev \
+            libgl1-mesa-dri \
+            libgtk-4-dev \
+            libwebkitgtk-6.0-dev \
+            pkg-config \
+            util-linux \
+            weston
+
+      - name: Build libghostty for embedding
+        run: |
+          cd ghostty
+          zig build -Dapp-runtime=none -Doptimize=ReleaseFast -Dcpu=baseline
+
+      - name: Run live GTK host smoke test
+        env:
+          LIMUX_SMOKE_PROFILE: debug
+        run: ./scripts/xvfb-smoke-test.sh

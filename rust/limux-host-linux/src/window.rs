@@ -50,7 +50,7 @@ struct Workspace {
     notify_dot: gtk::Label,
     /// Notification message label in the sidebar row.
     notify_label: gtk::Label,
-    /// Whether this workspace has unread notifications.
+    /// Unread state for notifications without a tab target.
     unread: bool,
     /// Whether this workspace is favorited/pinned to top.
     favorite: bool,
@@ -59,7 +59,6 @@ struct Workspace {
     /// The folder path this workspace was opened with.
     folder_path: Option<String>,
     /// Path label shown below workspace name in sidebar.
-    #[allow(dead_code)]
     path_label: gtk::Label,
 }
 
@@ -155,8 +154,8 @@ fn send_pane_create_response_after_command(
     reply: std::sync::mpsc::Sender<Result<serde_json::Value, BridgeError>>,
 ) {
     let mut attempts = 0;
+    let mut command_sent = false;
     let mut reply = Some(reply);
-    let command = format!("{command}\n");
 
     glib::timeout_add_local(
         std::time::Duration::from_millis(PANE_CREATE_COMMAND_READY_INTERVAL_MS),
@@ -166,7 +165,10 @@ fn send_pane_create_response_after_command(
             if let Some((matched_surface_id, handle)) =
                 pane::exact_terminal_handle_for_surface(&pane_widget, &surface_id)
             {
-                if matched_surface_id == surface_id && handle.send_text(&command) {
+                if matched_surface_id == surface_id && !command_sent {
+                    command_sent = handle.send_text(&command);
+                }
+                if command_sent && handle.send_key("Enter") {
                     if let Some(reply) = reply.take() {
                         let _ = reply.send(Ok(response.clone()));
                     }
@@ -1586,6 +1588,22 @@ pub fn build_window(app: &adw::Application) {
 
     {
         let state = state.clone();
+        window.connect_is_active_notify(move |window| {
+            if !window.is_active() {
+                return;
+            }
+            let workspace_id = state
+                .borrow()
+                .active_workspace()
+                .map(|workspace| workspace.id.clone());
+            if let Some(workspace_id) = workspace_id {
+                clear_visible_tab_unread(&state, &workspace_id);
+            }
+        });
+    }
+
+    {
+        let state = state.clone();
         let system_prefers_dark = system_prefers_dark.clone();
         style_manager.connect_dark_notify(move |style_manager| {
             sync_ghostty_color_scheme_for_config(
@@ -1632,27 +1650,23 @@ pub fn build_window(app: &adw::Application) {
     register_window_actions(&window, &state);
     install_key_capture(&window, &state);
 
-    // Any click anywhere in the window commits an active sidebar rename,
-    // UNLESS the click is inside the rename Entry itself.
+    // Any click anywhere in the window commits an active inline rename,
+    // unless the click is inside the rename entry itself.
     {
         let sl = sidebar_list.clone();
         let win = window.clone();
         let click_anywhere = gtk::GestureClick::new();
         click_anywhere.set_propagation_phase(gtk::PropagationPhase::Capture);
         click_anywhere.connect_pressed(move |_, _, x, y| {
-            if let Some(entry) = find_active_rename_entry(&sl) {
-                // Translate click coords from window to the entry's coordinate space
-                if let Some((ex, ey)) = win.translate_coordinates(&entry, x, y) {
-                    let alloc = entry.allocation();
-                    if ex >= 0.0
-                        && ey >= 0.0
-                        && ex <= alloc.width() as f64
-                        && ey <= alloc.height() as f64
-                    {
-                        return; // click is inside the entry
-                    }
-                }
-                commit_any_active_rename(&sl);
+            let entry = find_active_rename_entry(&sl).or_else(|| pane::find_tab_rename_entry(&win));
+            if let Some(entry) = entry {
+                let allocation = entry.allocation();
+                commit_inline_rename_for_click(
+                    win.translate_coordinates(&entry, x, y),
+                    allocation.width(),
+                    allocation.height(),
+                    || entry.emit_activate(),
+                );
             }
         });
         window.add_controller(click_anywhere);
@@ -2721,8 +2735,26 @@ fn activate_desktop_notification_target(
 }
 
 fn focus_desktop_notification_target(state: &State, target: &DesktopNotificationTarget) -> bool {
+    let workspace = {
+        let s = state.borrow();
+        s.workspaces
+            .iter()
+            .find(|workspace| workspace.id == target.workspace_id)
+            .map(|workspace| (workspace.root.clone(), workspace.split_container.clone()))
+    };
+
     if let Some(pane_id) = target.pane_id {
         if let Some(pane_widget) = pane::find_pane_widget_by_id(pane_id) {
+            if let Some((root, container)) = workspace.as_ref() {
+                if !pane_widget.is_ancestor(root) {
+                    if let Some(tab_id) = target.tab_id.as_deref() {
+                        pane::activate_tab_in_pane(&pane_widget, tab_id);
+                    }
+                    if container.reveal_pane(&pane_widget) {
+                        return true;
+                    }
+                }
+            }
             if let Some(tab_id) = target.tab_id.as_deref() {
                 if pane::activate_tab_in_pane(&pane_widget, tab_id) {
                     return true;
@@ -2735,15 +2767,7 @@ fn focus_desktop_notification_target(state: &State, target: &DesktopNotification
         }
     }
 
-    let root = {
-        let s = state.borrow();
-        s.workspaces
-            .iter()
-            .find(|workspace| workspace.id == target.workspace_id)
-            .map(|workspace| workspace.root.clone())
-    };
-
-    if let Some(root) = root {
+    if let Some((root, _)) = workspace {
         focus_workspace_entrypoint(&root);
         return true;
     }
@@ -2853,6 +2877,7 @@ fn activate_last_workspace_shortcut(state: &State) {
 fn build_sidebar_row(
     name: &str,
     folder_path: Option<&str>,
+    show_workspace_path: bool,
 ) -> (
     gtk::ListBoxRow,
     gtk::Label,
@@ -2894,10 +2919,8 @@ fn build_sidebar_row(
     if let Some(p) = folder_path {
         path_label.set_label(&abbreviate_path(p));
         path_label.set_tooltip_text(Some(p));
-        path_label.set_visible(true);
-    } else {
-        path_label.set_visible(false);
     }
+    path_label.set_visible(workspace_path_visible(folder_path, show_workspace_path));
 
     let notify_label = gtk::Label::builder()
         .xalign(0.0)
@@ -2927,6 +2950,20 @@ fn build_sidebar_row(
         notify_label,
         path_label,
     )
+}
+
+fn workspace_path_visible(folder_path: Option<&str>, show_workspace_path: bool) -> bool {
+    show_workspace_path && folder_path.is_some()
+}
+
+fn sync_workspace_path_visibility(state: &State, show_workspace_path: bool) {
+    let app_state = state.borrow();
+    for workspace in &app_state.workspaces {
+        workspace.path_label.set_visible(workspace_path_visible(
+            workspace.folder_path.as_deref(),
+            show_workspace_path,
+        ));
+    }
 }
 
 /// Abbreviate a path by replacing the home directory with ~.
@@ -3122,29 +3159,17 @@ fn find_active_rename_entry(sidebar_list: &gtk::ListBox) -> Option<gtk::Entry> {
     None
 }
 
-/// Find any active rename Entry in the sidebar and trigger its activate signal to commit.
-fn commit_any_active_rename(sidebar_list: &gtk::ListBox) {
-    let mut row = sidebar_list.first_child();
-    while let Some(r) = row {
-        // Walk into the row's children to find a gtk::Entry
-        fn find_entry(widget: &gtk::Widget) -> Option<gtk::Entry> {
-            if let Some(entry) = widget.downcast_ref::<gtk::Entry>() {
-                return Some(entry.clone());
-            }
-            let mut child = widget.first_child();
-            while let Some(c) = child {
-                if let Some(entry) = find_entry(&c) {
-                    return Some(entry);
-                }
-                child = c.next_sibling();
-            }
-            None
-        }
-        if let Some(entry) = find_entry(&r) {
-            entry.emit_activate();
-            return;
-        }
-        row = r.next_sibling();
+fn commit_inline_rename_for_click(
+    translated_click: Option<(f64, f64)>,
+    entry_width: i32,
+    entry_height: i32,
+    commit: impl FnOnce(),
+) {
+    let click_is_inside = translated_click.is_some_and(|(x, y)| {
+        x >= 0.0 && y >= 0.0 && x <= entry_width as f64 && y <= entry_height as f64
+    });
+    if !click_is_inside {
+        commit();
     }
 }
 
@@ -3449,8 +3474,14 @@ fn create_workspace_for_tab(state: &State, payload: &str) -> bool {
     let split_container = SplitTreeContainer::new(state, pane.clone().upcast());
     let root = split_container.widget().clone();
 
+    let show_workspace_path = state
+        .borrow()
+        .config
+        .borrow()
+        .appearance
+        .show_workspace_path;
     let (row, name_label, favorite_button, notify_dot, notify_label, path_label) =
-        build_sidebar_row(&seed.name, seed.folder_path.as_deref());
+        build_sidebar_row(&seed.name, seed.folder_path.as_deref(), show_workspace_path);
     let row_clone = row.clone();
     {
         let mut app_state = state.borrow_mut();
@@ -4466,6 +4497,7 @@ fn handle_control_command(state: &State, command: ControlCommand) {
         }
         ControlCommand::CreateNotification {
             target,
+            surface_hint,
             title,
             subtitle,
             body,
@@ -4478,14 +4510,28 @@ fn handle_control_command(state: &State, command: ControlCommand) {
                 workspace_index_for_target(&app_state, &target)
             };
 
-            let Some(index) = resolved else {
+            let Some(preferred_index) = resolved else {
                 let _ = reply.send(Err(crate::control_bridge::BridgeError::not_found(
                     "workspace not found",
                 )));
                 return;
             };
 
-            let ws_id = state.borrow().workspaces[index].id.clone();
+            let (index, tab_target) = surface_hint
+                .as_deref()
+                .map(|surface| resolve_notification_tab_target(state, preferred_index, surface))
+                .unwrap_or((preferred_index, None));
+
+            let (ws_id, root, workspace_is_active, window_active) = {
+                let s = state.borrow();
+                let workspace = &s.workspaces[index];
+                (
+                    workspace.id.clone(),
+                    workspace.root.clone(),
+                    index == s.active_idx,
+                    s.window.is_active(),
+                )
+            };
 
             // Build the sidebar message: title becomes the bold prefix,
             // subtitle + body are joined with " — " for the body text.
@@ -4496,13 +4542,18 @@ fn handle_control_command(state: &State, command: ControlCommand) {
                 (false, false) => format!("{subtitle} — {body}"),
             };
             let message = workspace_notification_message(&title, &combined_body);
+            let source_focused = tab_target.as_ref().is_some_and(|(pane_id, tab_id)| {
+                window_active
+                    && workspace_is_active
+                    && pane::tab_is_visible_in_workspace(&ws_id, &root, *pane_id, tab_id)
+            });
             let target = DesktopNotificationTarget {
                 workspace_id: ws_id.clone(),
-                pane_id: None,
-                tab_id: None,
+                pane_id: tab_target.as_ref().map(|(pane_id, _)| *pane_id),
+                tab_id: tab_target.map(|(_, tab_id)| tab_id),
             };
             if let Some(request) =
-                mark_workspace_unread_with_message(state, &ws_id, &message, false, target)
+                mark_workspace_unread_with_message(state, &ws_id, &message, source_focused, target)
             {
                 show_desktop_notification(state, request);
             }
@@ -4544,8 +4595,18 @@ fn add_workspace_from_state(state: &State, workspace: &WorkspaceState) {
         build_workspace_root(state, &shortcuts, &id, working_dir, &workspace.layout);
     stack.add_named(&root, Some(&stack_name));
 
+    let show_workspace_path = state
+        .borrow()
+        .config
+        .borrow()
+        .appearance
+        .show_workspace_path;
     let (row, name_label, favorite_button, notify_dot, notify_label, path_label) =
-        build_sidebar_row(&workspace.name, workspace.folder_path.as_deref());
+        build_sidebar_row(
+            &workspace.name,
+            workspace.folder_path.as_deref(),
+            show_workspace_path,
+        );
     sidebar_list.append(&row);
     install_workspace_row_interactions(state, &id, &row, &favorite_button);
 
@@ -4597,12 +4658,16 @@ pub(crate) fn create_pane_for_workspace(
     let state_for_keybinds = state.clone();
     let state_for_pwd = state.clone();
     let state_for_empty = state.clone();
+    let state_for_unread = state.clone();
+    let state_for_visibility = state.clone();
     let ws_id_split = ws_id.to_string();
     let ws_id_close = ws_id.to_string();
     let ws_id_bell = ws_id.to_string();
     let ws_id_desktop_notification = ws_id.to_string();
     let ws_id_pwd = ws_id.to_string();
     let ws_id_empty = ws_id.to_string();
+    let ws_id_unread = ws_id.to_string();
+    let ws_id_visibility = ws_id.to_string();
     let state_for_split_with_tab = state.clone();
     let state_for_config = state.clone();
     let state_for_config_changed = state.clone();
@@ -4610,6 +4675,7 @@ pub(crate) fn create_pane_for_workspace(
     let ws_id_for_env = ws_id.to_string();
 
     let callbacks = Rc::new(PaneCallbacks {
+        workspace_id: ws_id.to_string(),
         on_split: Box::new(move |pane_widget, orientation| {
             split_pane(
                 &state_for_split,
@@ -4697,12 +4763,29 @@ pub(crate) fn create_pane_for_workspace(
             });
         }),
         on_empty: Box::new(move |pane_widget, reason| {
-            let persist = matches!(reason, pane::PaneEmptyReason::ClosedLastTab);
+            if should_keep_workspace_open_for_empty_pane(&state_for_empty, &ws_id_empty, reason) {
+                request_session_save(&state_for_empty);
+                return;
+            }
+            let persist = matches!(
+                reason,
+                pane::PaneEmptyReason::ClosedLastTerminal | pane::PaneEmptyReason::ClosedLastTab
+            );
             remove_pane_internal(&state_for_empty, &ws_id_empty, pane_widget, persist);
         }),
         on_state_changed: Box::new({
             let state = state.clone();
             move || request_session_save(&state)
+        }),
+        on_unread_changed: Box::new(move || {
+            sync_workspace_unread(&state_for_unread, &ws_id_unread);
+        }),
+        is_pane_visible: Box::new(move |pane_widget| {
+            let s = state_for_visibility.borrow();
+            s.window.is_active()
+                && s.active_workspace().is_some_and(|workspace| {
+                    workspace.id == ws_id_visibility && pane_widget.is_ancestor(&workspace.root)
+                })
         }),
         on_split_with_tab: Box::new(
             move |source_pane, target_pane, orientation, tab_id, new_pane_first| {
@@ -4730,6 +4813,13 @@ pub(crate) fn create_pane_for_workspace(
                 if updated.appearance.ui_scale != previous.appearance.ui_scale {
                     reload_app_css(&state_for_config_changed, updated);
                 }
+                if updated.appearance.show_workspace_path != previous.appearance.show_workspace_path
+                {
+                    sync_workspace_path_visibility(
+                        &state_for_config_changed,
+                        updated.appearance.show_workspace_path,
+                    );
+                }
                 if let Err(err) = app_config::save(updated) {
                     state_for_config_changed
                         .borrow()
@@ -4739,6 +4829,14 @@ pub(crate) fn create_pane_for_workspace(
                     apply_appearance(&style_manager, system_prefers_dark, &previous.appearance);
                     if updated.appearance.ui_scale != previous.appearance.ui_scale {
                         reload_app_css(&state_for_config_changed, previous);
+                    }
+                    if updated.appearance.show_workspace_path
+                        != previous.appearance.show_workspace_path
+                    {
+                        sync_workspace_path_visibility(
+                            &state_for_config_changed,
+                            previous.appearance.show_workspace_path,
+                        );
                     }
 
                     let detail = format!("Failed to save Limux settings: {err}");
@@ -4830,46 +4928,34 @@ fn close_workspace_by_id_internal(
 }
 
 fn switch_workspace(state: &State, idx: usize) {
-    let (stack, stack_name, unread_handles, focus_root) = {
-        let mut s = state.borrow_mut();
-        if idx >= s.workspaces.len() || idx == s.active_idx {
+    let active_workspace_id = {
+        let s = state.borrow();
+        if idx >= s.workspaces.len() {
             return;
         }
+        (idx == s.active_idx).then(|| s.workspaces[idx].id.clone())
+    };
+    if let Some(workspace_id) = active_workspace_id {
+        clear_visible_tab_unread(state, &workspace_id);
+        return;
+    }
+
+    let (stack, stack_name, focus_root, workspace_id) = {
+        let mut s = state.borrow_mut();
         s.active_idx = idx;
         let stack = s.stack.clone();
         let stack_name = format!("ws-{}", s.workspaces[idx].id);
         let focus_root = s.workspaces[idx].root.clone();
+        let workspace_id = s.workspaces[idx].id.clone();
 
-        let unread_handles = if s.workspaces[idx].unread {
-            let ws = &mut s.workspaces[idx];
-            ws.unread = false;
-            Some((
-                ws.notify_dot.clone(),
-                ws.notify_label.clone(),
-                ws.sidebar_row.clone(),
-            ))
-        } else {
-            None
-        };
-
-        (stack, stack_name, unread_handles, focus_root)
+        (stack, stack_name, focus_root, workspace_id)
     };
 
     stack.set_visible_child_name(&stack_name);
+    clear_visible_tab_unread(state, &workspace_id);
     glib::idle_add_local_once(move || {
         focus_workspace_entrypoint(&focus_root);
     });
-
-    if let Some((notify_dot, notify_label, sidebar_row)) = unread_handles {
-        notify_dot.remove_css_class("limux-notify-dot");
-        notify_dot.add_css_class("limux-notify-dot-hidden");
-        notify_label.remove_css_class("limux-notify-msg-unread");
-        notify_label.add_css_class("limux-notify-msg");
-        notify_label.set_visible(false);
-        if let Some(row_box) = sidebar_row.child() {
-            row_box.remove_css_class("limux-sidebar-row-unread");
-        }
-    }
 
     request_session_save(state);
 }
@@ -5135,6 +5221,34 @@ fn remove_pane(state: &State, ws_id: &str, pane_widget: &gtk::Widget) {
     remove_pane_internal(state, ws_id, pane_widget, true);
 }
 
+fn should_keep_workspace_open_for_empty_pane(
+    state: &State,
+    ws_id: &str,
+    reason: pane::PaneEmptyReason,
+) -> bool {
+    let s = state.borrow();
+    let enabled = s
+        .config
+        .borrow()
+        .workspace
+        .keep_open_after_last_terminal_closes;
+    let is_only_pane = s
+        .workspaces
+        .iter()
+        .find(|workspace| workspace.id == ws_id)
+        .is_some_and(|workspace| workspace.split_container.is_single_pane());
+
+    keep_workspace_open_after_empty_pane(enabled, reason, is_only_pane)
+}
+
+fn keep_workspace_open_after_empty_pane(
+    enabled: bool,
+    reason: pane::PaneEmptyReason,
+    is_only_pane: bool,
+) -> bool {
+    enabled && reason == pane::PaneEmptyReason::ClosedLastTerminal && is_only_pane
+}
+
 fn remove_pane_internal(state: &State, ws_id: &str, pane_widget: &gtk::Widget, persist: bool) {
     let container = {
         let s = state.borrow();
@@ -5153,7 +5267,11 @@ fn remove_pane_internal(state: &State, ws_id: &str, pane_widget: &gtk::Widget, p
     }
 
     // Mutate the data model and trigger async widget tree rebuild
-    container.remove(pane_widget);
+    if !container.remove(pane_widget) {
+        return;
+    }
+    pane::retire_pane(pane_widget);
+    sync_workspace_unread(state, ws_id);
 
     if persist {
         request_session_save(state);
@@ -5355,7 +5473,34 @@ fn broadcast_font_size(size: f32) {
     crate::terminal::broadcast_binding_action(&action);
 }
 
+fn browser_command_requires_existing_target(command: ShortcutCommand) -> bool {
+    command != ShortcutCommand::OpenBrowserInSplit
+}
+
 fn dispatch_browser_command(state: &State, command: ShortcutCommand) -> bool {
+    if !browser_command_requires_existing_target(command) {
+        let uri = match focused_shortcut_target(state) {
+            pane::FocusedShortcutTarget::Browser(target) => target.current_uri(),
+            _ => None,
+        };
+        let Some((ws_id, pane_widget)) = find_leaf_focused_pane(state) else {
+            return false;
+        };
+        return split_pane(
+            state,
+            &ws_id,
+            &pane_widget,
+            gtk::Orientation::Horizontal,
+            SplitPaneOptions {
+                initial_state: Some(PaneState::browser_only(uri.as_deref())),
+                skip_default_tab: false,
+                new_pane_first: false,
+                persist: true,
+            },
+        )
+        .is_some();
+    }
+
     let pane::FocusedShortcutTarget::Browser(target) = focused_shortcut_target(state) else {
         return false;
     };
@@ -5372,25 +5517,6 @@ fn dispatch_browser_command(state: &State, command: ShortcutCommand) -> bool {
         ShortcutCommand::SurfaceFindPrevious => target.find_previous(),
         ShortcutCommand::SurfaceFindHide => target.hide_find(),
         ShortcutCommand::SurfaceUseSelectionForFind => target.use_selection_for_find(),
-        ShortcutCommand::OpenBrowserInSplit => {
-            let uri = target.current_uri();
-            let Some((ws_id, pane_widget)) = find_leaf_focused_pane(state) else {
-                return false;
-            };
-            split_pane(
-                state,
-                &ws_id,
-                &pane_widget,
-                gtk::Orientation::Horizontal,
-                SplitPaneOptions {
-                    initial_state: Some(PaneState::browser_only(uri.as_deref())),
-                    skip_default_tab: false,
-                    new_pane_first: false,
-                    persist: true,
-                },
-            )
-            .is_some()
-        }
         _ => false,
     }
 }
@@ -5436,9 +5562,15 @@ fn close_focused_tab(state: &State) {
         return;
     };
 
+    let config = state.borrow().config.clone();
+    let keep_workspace_open = config
+        .borrow()
+        .workspace
+        .keep_open_after_last_terminal_closes;
     if let Some(parent) = pane_widget.parent() {
         if parent.downcast_ref::<gtk::Stack>().is_some()
             && pane::tab_count_in_pane(&pane_widget) <= 1
+            && !keep_workspace_open
         {
             return;
         }
@@ -5739,8 +5871,16 @@ fn find_leaf_pane(widget: &gtk::Widget, axis: gtk::Orientation, prefer_start: bo
             Some(c) => find_leaf_pane(&c, axis, prefer_start),
             None => widget.clone(),
         }
+    } else if let Some(box_widget) = widget.downcast_ref::<gtk::Box>() {
+        // A gtk::Box may be a pane widget (leaf) or a SplitTreeContainer bin
+        // wrapping a single pane or paned. Descend into non-pane boxes.
+        if !pane::is_pane_widget(widget) {
+            if let Some(first_child) = box_widget.first_child() {
+                return find_leaf_pane(&first_child, axis, prefer_start);
+            }
+        }
+        widget.clone()
     } else {
-        // Leaf pane — this is a pane gtk::Box
         widget.clone()
     }
 }
@@ -5752,6 +5892,119 @@ fn should_emit_desktop_notification(
     source_focused: bool,
 ) -> bool {
     desktop_notifications_enabled && (!window_active || !workspace_is_active || !source_focused)
+}
+
+fn resolve_notification_tab_target(
+    state: &State,
+    preferred_index: usize,
+    surface_hint: &str,
+) -> (usize, Option<(u32, String)>) {
+    let workspace_ids = state
+        .borrow()
+        .workspaces
+        .iter()
+        .map(|workspace| workspace.id.clone())
+        .collect::<Vec<_>>();
+
+    match pane::tab_target_for_workspace(&workspace_ids[preferred_index], surface_hint) {
+        pane::TabTargetResolution::Unique(pane_id, tab_id) => {
+            return (preferred_index, Some((pane_id, tab_id)));
+        }
+        pane::TabTargetResolution::Ambiguous => return (preferred_index, None),
+        pane::TabTargetResolution::NotFound => {}
+    }
+
+    let mut target = None;
+    for (index, workspace_id) in workspace_ids.iter().enumerate() {
+        if index == preferred_index {
+            continue;
+        }
+        match pane::tab_target_for_workspace(workspace_id, surface_hint) {
+            pane::TabTargetResolution::Unique(pane_id, tab_id) if target.is_none() => {
+                target = Some((index, pane_id, tab_id));
+            }
+            pane::TabTargetResolution::Unique(_, _) | pane::TabTargetResolution::Ambiguous => {
+                return (preferred_index, None);
+            }
+            pane::TabTargetResolution::NotFound => {}
+        }
+    }
+
+    target
+        .map(|(index, pane_id, tab_id)| (index, Some((pane_id, tab_id))))
+        .unwrap_or((preferred_index, None))
+}
+
+fn has_unread(workspace_unread: bool, tab_unread: bool) -> bool {
+    workspace_unread || tab_unread
+}
+
+fn set_workspace_unread_visual(workspace: &Workspace, unread: bool) {
+    if unread {
+        workspace
+            .notify_dot
+            .remove_css_class("limux-notify-dot-hidden");
+        workspace.notify_dot.add_css_class("limux-notify-dot");
+        workspace.notify_label.remove_css_class("limux-notify-msg");
+        workspace
+            .notify_label
+            .add_css_class("limux-notify-msg-unread");
+        workspace
+            .notify_label
+            .set_visible(!workspace.notify_label.label().is_empty());
+        if let Some(row_box) = workspace.sidebar_row.child() {
+            row_box.add_css_class("limux-sidebar-row-unread");
+        }
+    } else {
+        workspace.notify_dot.remove_css_class("limux-notify-dot");
+        workspace
+            .notify_dot
+            .add_css_class("limux-notify-dot-hidden");
+        workspace
+            .notify_label
+            .remove_css_class("limux-notify-msg-unread");
+        workspace.notify_label.add_css_class("limux-notify-msg");
+        workspace.notify_label.set_visible(false);
+        workspace.notify_label.set_label("");
+        if let Some(row_box) = workspace.sidebar_row.child() {
+            row_box.remove_css_class("limux-sidebar-row-unread");
+        }
+    }
+}
+
+fn sync_workspace_unread(state: &State, ws_id: &str) {
+    let workspace_unread = {
+        let s = state.borrow();
+        let Some(workspace) = s.workspaces.iter().find(|workspace| workspace.id == ws_id) else {
+            return;
+        };
+        workspace.unread
+    };
+    let tab_unread = pane::workspace_has_unread_tabs(ws_id);
+    let s = state.borrow();
+    if let Some(workspace) = s.workspaces.iter().find(|workspace| workspace.id == ws_id) {
+        set_workspace_unread_visual(workspace, has_unread(workspace_unread, tab_unread));
+    }
+}
+
+fn clear_visible_tab_unread(state: &State, ws_id: &str) {
+    let root = {
+        let mut s = state.borrow_mut();
+        if !s.window.is_active() {
+            return;
+        }
+        let Some(workspace) = s
+            .workspaces
+            .iter_mut()
+            .find(|workspace| workspace.id == ws_id)
+        else {
+            return;
+        };
+        workspace.unread = false;
+        workspace.root.clone()
+    };
+    pane::clear_active_tab_unread_in_root(&root);
+    sync_workspace_unread(state, ws_id);
 }
 
 fn mark_workspace_unread(
@@ -5787,48 +6040,62 @@ fn mark_workspace_unread_with_message(
     source_focused: bool,
     target: DesktopNotificationTarget,
 ) -> Option<DesktopNotificationRequest> {
-    let mut s = state.borrow_mut();
-    let active_idx = s.active_idx;
-    let window_active = s.window.is_active();
-    let notifications = s.config.borrow().notifications;
-    if let Some((idx, ws)) = s
-        .workspaces
-        .iter_mut()
-        .enumerate()
-        .find(|(_, w)| w.id == ws_id)
-    {
-        let workspace_is_active = idx == active_idx;
-        let desktop_request = should_emit_desktop_notification(
-            notifications.enabled,
-            window_active,
-            workspace_is_active,
-            source_focused,
+    let (workspace_idx, active_idx, workspace_name, window_active, notifications) = {
+        let s = state.borrow();
+        let workspace_idx = s
+            .workspaces
+            .iter()
+            .position(|workspace| workspace.id == ws_id)?;
+        let workspace = &s.workspaces[workspace_idx];
+        let notifications = s.config.borrow().notifications;
+        (
+            workspace_idx,
+            s.active_idx,
+            workspace.name.clone(),
+            s.window.is_active(),
+            notifications,
         )
-        .then(|| DesktopNotificationRequest {
-            summary: ws.name.clone(),
-            body: message.to_string(),
-            sound: notifications.sound,
-            target: target.clone(),
-        });
+    };
+    let workspace_is_active = workspace_idx == active_idx;
+    let desktop_request = should_emit_desktop_notification(
+        notifications.enabled,
+        window_active,
+        workspace_is_active,
+        source_focused,
+    )
+    .then(|| DesktopNotificationRequest {
+        summary: workspace_name,
+        body: message.to_string(),
+        sound: notifications.sound,
+        target: target.clone(),
+    });
 
-        if idx != active_idx {
-            ws.unread = true;
-            ws.notify_dot.remove_css_class("limux-notify-dot-hidden");
-            ws.notify_dot.add_css_class("limux-notify-dot");
-            ws.notify_label.set_label(message);
-            ws.notify_label.remove_css_class("limux-notify-msg");
-            ws.notify_label.add_css_class("limux-notify-msg-unread");
-            ws.notify_label.set_visible(true);
-            // Add glow pulse to the sidebar row box
-            if let Some(row_box) = ws.sidebar_row.child() {
-                row_box.add_css_class("limux-sidebar-row-unread");
+    let source_is_unread = !window_active || !workspace_is_active || !source_focused;
+    if source_is_unread {
+        let tab_target = target.pane_id.zip(target.tab_id.as_deref());
+        let tab_was_targeted = tab_target
+            .and_then(|(pane_id, tab_id)| {
+                pane::mark_tab_unread_in_workspace(ws_id, pane_id, tab_id)
+            })
+            .is_some();
+        let mark_workspace_level = !tab_was_targeted;
+
+        if tab_was_targeted || mark_workspace_level {
+            let mut s = state.borrow_mut();
+            if let Some(workspace) = s
+                .workspaces
+                .iter_mut()
+                .find(|workspace| workspace.id == ws_id)
+            {
+                workspace.unread |= mark_workspace_level;
+                workspace.notify_label.set_label(message);
             }
+            drop(s);
+            sync_workspace_unread(state, ws_id);
         }
-
-        return desktop_request;
     }
 
-    None
+    desktop_request
 }
 
 fn desktop_notification_hints(
@@ -5915,7 +6182,7 @@ fn show_desktop_notification(state: &State, request: DesktopNotificationRequest)
 
 #[cfg(test)]
 mod tests {
-    use std::cell::RefCell;
+    use std::cell::{Cell, RefCell};
     use std::rc::Rc;
 
     use super::glib;
@@ -5923,20 +6190,22 @@ mod tests {
     use super::gtk::gdk;
     use super::ToVariant;
     use super::{
-        build_window_css, clamp_workspace_insert_index_for_pinning,
+        browser_command_requires_existing_target, build_window_css,
+        clamp_workspace_insert_index_for_pinning, commit_inline_rename_for_click,
         desktop_notification_action_from_signal, desktop_notification_actions,
         desktop_notification_activation_token_from_signal,
         desktop_notification_closed_id_from_signal, desktop_notification_id_from_response,
-        directional_neighbor_score, favorites_prefix_len, font_size_after_delta,
-        ghostty_prefers_dark, gtk_system_prefers_dark_from_raw, next_active_workspace_index,
+        directional_neighbor_score, favorites_prefix_len, find_leaf_pane, font_size_after_delta,
+        ghostty_prefers_dark, gtk_system_prefers_dark_from_raw, has_unread,
+        keep_workspace_open_after_empty_pane, next_active_workspace_index,
         pane_create_split_placement, queue_session_save_request, resolve_pane_create_source_id,
         resolved_system_prefers_dark, sanitize_background_opacity,
         shortcut_allowed_while_browser_find_active, shortcut_blocked_by_editable,
         shortcut_command_from_key_event, shortcut_dispatch_propagation,
         should_emit_desktop_notification, tab_drag_workspace_seed, use_opaque_window_background,
         validate_workspace_folder_input_with_dirs, workspace_drop_layout_path,
-        workspace_folder_path_from_input, workspace_notification_message, Direction,
-        EditableCaptureContext, NeighborScore, PaneBounds, PaneCreateDirection,
+        workspace_folder_path_from_input, workspace_notification_message, workspace_path_visible,
+        Direction, EditableCaptureContext, NeighborScore, PaneBounds, PaneCreateDirection,
         PaneCreateTargetError, PortalColorSchemePreference, SessionSaveAccess, SessionSaveRequest,
         WorkspaceSeedSource, BASE_CSS, HOST_ENTRY_CSS_CLASS, WORKSPACE_RENAME_ENTRY_CSS_CLASS,
         WORKSPACE_RENAME_ENTRY_CSS_CLASSES,
@@ -5969,6 +6238,35 @@ mod tests {
     fn favorites_prefix_len_counts_only_leading_favorites() {
         let flags = [true, true, false, true, false];
         assert_eq!(favorites_prefix_len(&flags), 2);
+    }
+
+    #[test]
+    fn workspace_lifecycle_preference_only_preserves_a_single_closed_pane() {
+        assert!(keep_workspace_open_after_empty_pane(
+            true,
+            crate::pane::PaneEmptyReason::ClosedLastTerminal,
+            true,
+        ));
+        assert!(!keep_workspace_open_after_empty_pane(
+            false,
+            crate::pane::PaneEmptyReason::ClosedLastTerminal,
+            true,
+        ));
+        assert!(!keep_workspace_open_after_empty_pane(
+            true,
+            crate::pane::PaneEmptyReason::ClosedLastTerminal,
+            false,
+        ));
+        assert!(!keep_workspace_open_after_empty_pane(
+            true,
+            crate::pane::PaneEmptyReason::ClosedLastTab,
+            true,
+        ));
+        assert!(!keep_workspace_open_after_empty_pane(
+            true,
+            crate::pane::PaneEmptyReason::MovedLastTabOut,
+            true,
+        ));
     }
 
     #[test]
@@ -6195,6 +6493,21 @@ mod tests {
     }
 
     #[test]
+    fn outside_rename_click_commits_while_inside_click_preserves_editor() {
+        for (click, should_commit) in [
+            (Some((0.0, 0.0)), false),
+            (Some((120.0, 32.0)), false),
+            (Some((-0.1, 16.0)), true),
+            (Some((60.0, 32.1)), true),
+            (None, true),
+        ] {
+            let entry_present = Cell::new(true);
+            commit_inline_rename_for_click(click, 120, 32, || entry_present.set(false));
+            assert_eq!(entry_present.get(), !should_commit, "click: {click:?}");
+        }
+    }
+
+    #[test]
     fn desktop_notification_actions_include_default_open_action() {
         assert_eq!(
             desktop_notification_actions(),
@@ -6397,6 +6710,13 @@ mod tests {
             false, false, false, false
         ));
         assert!(!should_emit_desktop_notification(true, true, true, true));
+    }
+
+    #[test]
+    fn workspace_badge_stays_unread_while_any_tab_is_unread() {
+        assert!(has_unread(false, true));
+        assert!(has_unread(true, false));
+        assert!(!has_unread(false, false));
     }
 
     #[test]
@@ -6723,6 +7043,16 @@ mod tests {
     }
 
     #[test]
+    fn open_browser_in_split_does_not_require_an_existing_browser_target() {
+        assert!(!browser_command_requires_existing_target(
+            ShortcutCommand::OpenBrowserInSplit
+        ));
+        assert!(browser_command_requires_existing_target(
+            ShortcutCommand::BrowserReload
+        ));
+    }
+
+    #[test]
     fn workspace_drop_layout_path_prefers_deterministic_startmost_leaf() {
         let layout = LayoutNodeState::Split(SplitState {
             orientation: SplitOrientation::Horizontal,
@@ -6787,6 +7117,13 @@ mod tests {
     }
 
     #[test]
+    fn workspace_path_visibility_requires_path_and_enabled_setting() {
+        assert!(workspace_path_visible(Some("/workspace"), true));
+        assert!(!workspace_path_visible(Some("/workspace"), false));
+        assert!(!workspace_path_visible(None, true));
+    }
+
+    #[test]
     fn workspace_folder_path_input_expands_home_and_relative_paths() {
         let home = std::path::Path::new("/home/tester");
         let current = std::path::Path::new("/tmp/current");
@@ -6833,5 +7170,58 @@ mod tests {
             .unwrap_err();
 
         assert!(error.ends_with(" is not a folder"));
+    }
+
+    #[test]
+    fn find_leaf_pane_descends_into_non_pane_boxes() {
+        use gtk4::prelude::{BoxExt, Cast, WidgetExt};
+
+        // GTK widget tests need a display. Skip silently on headless CI.
+        if gtk4::init().is_err() {
+            return;
+        }
+
+        let make_pane = || {
+            let pane = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
+            let header = gtk4::Box::new(gtk4::Orientation::Horizontal, 0);
+            header.add_css_class("limux-pane-header");
+            pane.append(&header);
+            pane
+        };
+
+        // A plain Box wrapping a single child simulates a SplitTreeContainer bin.
+        let bin = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
+        let inner_pane = make_pane();
+        bin.append(&inner_pane);
+
+        let leaf = find_leaf_pane(&bin.upcast(), gtk4::Orientation::Horizontal, true);
+        assert_eq!(
+            leaf,
+            inner_pane.clone().upcast::<gtk4::Widget>(),
+            "find_leaf_pane should descend through a non-pane Box"
+        );
+
+        // A Box that is a pane widget should be returned as-is.
+        let pane = make_pane();
+
+        let leaf = find_leaf_pane(&pane.clone().upcast(), gtk4::Orientation::Horizontal, true);
+        assert_eq!(
+            leaf,
+            pane.clone().upcast::<gtk4::Widget>(),
+            "find_leaf_pane should treat a pane Box as a leaf"
+        );
+
+        // A Paned should descend to its actual leaf.
+        let paned = gtk4::Paned::new(gtk4::Orientation::Horizontal);
+        let left_pane = make_pane();
+        paned.set_start_child(Some(&left_pane));
+        paned.set_end_child(Some(&make_pane()));
+
+        let leaf = find_leaf_pane(&paned.upcast(), gtk4::Orientation::Horizontal, true);
+        assert_eq!(
+            leaf,
+            left_pane.clone().upcast::<gtk4::Widget>(),
+            "find_leaf_pane should descend through a Paned to its leaf"
+        );
     }
 }
